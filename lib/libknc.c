@@ -74,7 +74,16 @@ struct knc_stream {
 	struct knc_stream_gc	*garbage;
 	size_t			 bufpos;
 	size_t			 avail;
+	char			*failed_func;
+	int			 errnum;
 };
+
+#define KNC_STREAM_ERROR(s, d, r)	\
+	do {				\
+		(s)->failed_func = (d);	\
+		(s)->errnum = errno;	\
+		return (r);		\
+	} while (0/*CONSTCOND*/)
 
 struct knc_ctx {
 	/* GSS input/output data */
@@ -107,6 +116,7 @@ struct knc_ctx {
 #define STATE_SESSION	0x3
 #define STATE_COMMAND	0x4
 	int			 error;
+	int			 errnum;
 	int			 debug;
 #define KNC_ERROR_GSS		0x1
 #define KNC_ERROR_PROTO		0x2
@@ -167,6 +177,8 @@ struct fd_cookie {
 #define MIN(a, b)	((a)<(b)?(a):(b))
 
 /* XXXrcd: eventually get rid of DEBUG() */
+/* XXXnico: debug should be a part of the ctx and streams, not a global */
+/* XXXnico: also, might as well put error info in streams as well */
 int debug = 0;
 #define DEBUG(x) do {				\
 		if (debug) {			\
@@ -194,6 +206,7 @@ static struct knc_stream_bit	*knc_alloc_stream_bit(size_t);
 static size_t			 knc_append_stream_bit(struct knc_stream *,
 				    struct knc_stream_bit *);
 
+static int	knc_stream_error(knc_ctx, struct knc_stream *);
 static size_t	knc_put_stream(struct knc_stream *, const void *, size_t);
 static size_t	knc_put_stream_gssbuf(struct knc_stream *, gss_buffer_t);
 static size_t	knc_get_istream(struct knc_stream *, void **, size_t);
@@ -308,7 +321,7 @@ knc_put_stream(struct knc_stream *s, const void *buf, size_t len)
 			break;
 
 		memcpy(newbuf, buf, ret);
-		knc_stream_fill(s, ret);
+		knc_stream_fill(s, ret); /* XXXnico: check for errors */
 
 		len   -= ret;
 		total += ret;
@@ -325,8 +338,7 @@ knc_put_stream_userbuf(struct knc_stream *s, void *buf, size_t len,
 
 	bit = calloc(1, sizeof(*bit));
 	if (!bit)
-		/* XXXrcd: hmmm, maybe we should raise an error here? */
-		return 0;
+		KNC_STREAM_ERROR(s, "calloc", 0);
 
 	bit->buf	= buf;
 	bit->allocated	= len;
@@ -354,8 +366,7 @@ knc_put_stream_gssbuf(struct knc_stream *s, gss_buffer_t inbuf)
 
 	buf = calloc(1, sizeof(*buf));
 	if (!buf)
-		/* XXXrcd: raise an error here? */
-		return 0;
+		KNC_STREAM_ERROR(s, "calloc", 0);
 
 	buf->value  = inbuf->value;
 	buf->length = inbuf->length;
@@ -387,17 +398,13 @@ knc_put_stream_mmapbuf(struct knc_stream *s, size_t len, int flags, int fd,
 
 	r = calloc(1, sizeof(*r));
 	if (!r)
-		/* XXXrcd: raise an error here? */
-		return 0;
+		KNC_STREAM_ERROR(s, "calloc", 0);
 
 	r->buf = mmap(NULL, len, PROT_READ, flags, fd, offset);
 	r->len = len;
 
-	/* XXXrcd: better errors would be appreciated... */
-
 	if (!r->buf)
-		/* XXXrcd: raise an error here? */
-		return 0;
+		KNC_STREAM_ERROR(s, "mmap", 0);
 
 	return knc_put_stream_userbuf(s, r->buf, r->len, free_mmapbuf, r);
 }
@@ -424,7 +431,7 @@ knc_get_istream(struct knc_stream *s, void **buf, size_t len)
 
 	tmp = knc_alloc_stream_bit(len);
 	if (!tmp)
-		return 0;
+		KNC_STREAM_ERROR(s, "calloc", 0);
 
 	knc_append_stream_bit(s, tmp);
 
@@ -481,10 +488,8 @@ knc_get_ostreamv(struct knc_stream *s, struct iovec **vec, int *count)
 			break;
 
 	*vec = malloc(i * sizeof(**vec));
-	if (!*vec) {
-		/* XXXrcd: better errors... */
-		return 0;
-	}
+	if (!*vec)
+		KNC_STREAM_ERROR(s, "malloc", 0);
 
 	i = 0;
 	len = 0;
@@ -547,7 +552,7 @@ knc_get_ostream_contig(struct knc_stream *s, void **buf, size_t len)
 
 	*buf = malloc(len);
 	if (*buf == NULL)
-		return 0;
+		KNC_STREAM_ERROR(s, "malloc", 0);
 	knc_stream_put_trash(s, *buf);
 
 	retlen = 0;
@@ -641,8 +646,7 @@ knc_stream_put_trash(struct knc_stream *s, void *ptr)
 
 	tmp = malloc(sizeof(*tmp));
 	if (!tmp)
-		/* XXXrcd: ??? */
-		return -1;
+		KNC_STREAM_ERROR(s, "calloc", -1);
 
 	tmp->ptr = ptr;
 	tmp->next = s->garbage;
@@ -737,7 +741,7 @@ put_packet(struct knc_stream *s, gss_buffer_t buf)
 
 	netlen = htonl((uint32_t)buf->length);
 	knc_put_stream(s, &netlen, 4);
-	knc_put_stream_gssbuf(s, buf);
+	knc_put_stream_gssbuf(s, buf); /* XXXnico: why ignore return? */
 
 	/* XXXrcd: useful to return this?  What about errors? */
 	return 0;
@@ -749,6 +753,8 @@ knc_ctx_init(void)
 	knc_ctx	ret;
 
 	ret = calloc(1, sizeof(*ret));
+	if (!ret)
+		return NULL;
 
 	/* Set some reasonable defaults */
 
@@ -812,7 +818,7 @@ knc_ctx_close(knc_ctx ctx)
 		(ctx->localclose)(ctx->localcookie);
 
 	/* XXXrcd: memory leaks?  */
-	/* XXXnico: smartass comment: use valgrind */
+	/* XXXnico: smartass comment: use valgrind ;) */
 
 	free(ctx->errstr);
 
@@ -957,7 +963,6 @@ knc_import_set_service(knc_ctx ctx, const char *service, const gss_OID nt)
 	if (!ctx)
 		return;
 
-	/* XXXrcd: sanity?  check if we are an initiator? */
 	if (knc_is_authenticated(ctx))
 		return;
 
@@ -975,6 +980,7 @@ knc_import_set_service(knc_ctx ctx, const char *service, const gss_OID nt)
 	free(name.value);
 
 	/* ??? XXXrcd: L4M3! */
+	/* XXXnico: er, so make this return something other than void?! */
 	KNC_GSS_ERROR(ctx, maj, min,, "gss_import_name");
 }
 
@@ -1015,6 +1021,7 @@ knc_set_cb(knc_ctx ctx, gss_channel_bindings_t cb)
 		return;
 
 	/* XXXrcd: caller frees? */
+	/* XXXnico: yes; we could dup it though... */
 
 	ctx->cb = cb;
 }
@@ -1183,9 +1190,14 @@ knc_state_init(knc_ctx ctx, void *buf, size_t len)
 	    ctx->cb, &in, &ctx->ret_mech, &out, &ctx->ret_flags,
 	    &ctx->time_rec);
 
-	if (out.length > 0)
+	if (out.length > 0) {
 		put_packet(&ctx->cooked_send, &out);
-		/* XXXrcd: errors? */
+		/*
+		 * If put_packet() fails the app will find out with
+		 * knc_error()
+		 */
+		knc_stream_error(ctx, &ctx->cooked_send);
+	}
 
 	KNC_GSS_ERROR(ctx, maj, min, -1, "gss_init_sec_context");
 
@@ -1218,9 +1230,10 @@ knc_state_accept(knc_ctx ctx, void *buf, size_t len)
 	    ctx->cb, &ctx->client, &ctx->ret_mech, &out,
 	    &ctx->ret_flags, &ctx->time_rec, &ctx->deleg_cred);
 
-	if (out.length)
+	if (out.length) {
 		put_packet(&ctx->cooked_send, &out);
-		/* XXXrcd: ERRORS?!? */
+		knc_stream_error(ctx, &ctx->cooked_send);
+	}
 
 	KNC_GSS_ERROR(ctx, maj, min, -1, "gss_accept_sec_context");
 
@@ -1252,8 +1265,6 @@ knc_state_session(knc_ctx ctx, void *buf, size_t len)
 	}
 
 	if (out.length == 0) {
-		/* XXXrcd: do we need this release? */
-		gss_release_buffer(&min, &out);
 		ctx->state = STATE_COMMAND;
 		return 0;
 	}
@@ -1298,6 +1309,21 @@ knc_state_command(knc_ctx ctx, void *buf, size_t len)
 	 *         end knows which one we are not implementing.  This
 	 *         will require that some structure be defined for the
 	 *         commands in advance of the first release...
+	 */
+	/*
+	 * XXXnico: So why not send two zero-length tokens in response
+	 *	    for now?  We don't know what to do with commands.
+	 *	    We expect that the next token will have command
+	 *	    data.  Assuming that each future command will have a
+	 *	    command response, all we need to do is process them
+	 *	    in order.  But even if we need XIDs so we can
+	 *	    process them out of order, a pair of zero-length
+	 *	    tokens should always suffice as a "don't know what
+	 *	    you're talking about" response: the peer can count
+	 *	    up these responses and match up actual responses to
+	 *	    requests and infer which requests were responded to
+	 *	    with "no clue man".  That's what I implemented
+	 *	    below.
 	 */
 
 	ctx->state = STATE_SESSION;
@@ -1375,7 +1401,30 @@ knc_state_process_out(knc_ctx ctx)
 	 * to ctx->cooked_send.
 	 */
 
-	/* XXXrcd: how about STATE_COMMAND? */
+	if (ctx->state == STATE_COMMAND) {
+		/* XXXnico: Yeah, manually unrolled loop of two go arounds */
+		in.length = 0;
+		in.value  = NULL;
+		maj = gss_wrap(&min, ctx->gssctx, privacy, GSS_C_QOP_DEFAULT,
+		    &in, NULL, &out);
+
+		KNC_GSS_ERROR(ctx, maj, min, -1, "gss_wrap");
+
+		put_packet(&ctx->cooked_send, &out);
+		knc_stream_error(ctx, &ctx->cooked_send);
+
+		in.length = 0;
+		in.value  = NULL;
+		maj = gss_wrap(&min, ctx->gssctx, privacy, GSS_C_QOP_DEFAULT,
+		    &in, NULL, &out);
+
+		KNC_GSS_ERROR(ctx, maj, min, -1, "gss_wrap");
+
+		put_packet(&ctx->cooked_send, &out);
+		knc_stream_error(ctx, &ctx->cooked_send);
+		ctx->state = STATE_SESSION;
+	}
+
 	if (ctx->state != STATE_SESSION)
 		return 0;
 
@@ -1402,6 +1451,7 @@ knc_state_process_out(knc_ctx ctx)
 		KNC_GSS_ERROR(ctx, maj, min, -1, "gss_wrap");
 
 		put_packet(&ctx->cooked_send, &out);
+		knc_stream_error(ctx, &ctx->cooked_send);
 		knc_stream_drain(&ctx->raw_send, len);
 	}
 
@@ -1443,10 +1493,16 @@ knc_find_buf(knc_ctx ctx, int side, int dir)
 size_t
 knc_put_buf(knc_ctx ctx, int dir, const void *buf, size_t len)
 {
+	struct knc_stream *s;
 
 	if (!ctx)
 		return 0;
 
+	s = knc_find_buf(ctx, KNC_SIDE_IN, dir);
+	if (!s) {
+		knc_generic_error(ctx, "no matching stream");
+		return 0;
+	}
 	return knc_put_stream(knc_find_buf(ctx, KNC_SIDE_IN, dir), buf, len);
 }
 
@@ -1468,24 +1524,37 @@ size_t
 knc_put_mmapbuf(knc_ctx ctx, int dir, size_t len, int flags, int fd,
 		off_t offset)
 {
+	struct knc_stream *s;
+	size_t ret;
 
 	if (!ctx) {
 		/* XXXrcd: should probably call the callback to free things. */
+		/* XXXnico: huh? what callback? there's no ctx to one from! */
 		return 0;
 	}
 
-	return knc_put_stream_mmapbuf(knc_find_buf(ctx, KNC_SIDE_IN, dir),
-	    len, flags, fd, offset);
+	s = knc_find_buf(ctx, KNC_SIDE_IN, dir);
+	ret = knc_put_stream_mmapbuf(s, len, flags, fd, offset);
+	knc_stream_error(ctx, s);
+	return ret;
 }
 
 size_t
 knc_get_ibuf(knc_ctx ctx, int dir, void **buf, size_t len)
 {
+	struct knc_stream *s;
+	size_t ret = 0;
 
 	if (!ctx)
 		return 0;
 
-	return knc_get_istream(knc_find_buf(ctx, KNC_SIDE_IN, dir), buf, len);
+	s = knc_find_buf(ctx, KNC_SIDE_IN, dir);
+	if (!s)
+		knc_generic_error(ctx, "no matching stream");
+	else
+		ret = knc_get_istream(s, buf, len);
+	knc_stream_error(ctx, s);
+	return ret;
 }
 
 size_t
@@ -1556,6 +1625,7 @@ knc_initiate(knc_ctx ctx)
 	/* XXXrcd: sanity! */
 
 #if 0	/* XXXrcd: this should go somewhere... */
+	/* XXXnico: this doesn't belong at all; it might not be krb5 */
 	KNCDEBUG(ctx, ("going to get tickets for: %s", (char *)name.value));
 #endif
 
@@ -1874,6 +1944,10 @@ static void _flush_send(knc_ctx ctx) { knc_flush(ctx, KNC_DIR_SEND, 0); }
 static void _flush_recv(knc_ctx ctx) { knc_flush(ctx, KNC_DIR_RECV, 0); }
 
 /* XXXrcd: arg, -1 ain't no nfds_t but we need to return errors... */
+/*
+ * XXXnico: that's OK, (nfds_t)-1 works, if the caller knows to check
+ *	    for that.
+ */
 
 nfds_t
 knc_get_pollfds(knc_ctx ctx, struct pollfd *fds, knc_callback *cbs,
@@ -2096,7 +2170,7 @@ knc_fill(knc_ctx ctx, int dir)
 
 	if (ret > 0) {
 		KNCDEBUG(ctx, ("Read %zd bytes\n", ret));
-		knc_fill_buf(ctx, dir, (size_t)ret);
+		knc_fill_buf(ctx, dir, (size_t)ret); /* XXXnice: errors? */
 	}
 
 	if (dir == KNC_DIR_RECV)
@@ -2326,6 +2400,11 @@ knc_write(knc_ctx ctx, const void *buf, size_t len)
 	if (knc_pending(ctx, KNC_DIR_SEND) > ctx->sendinbufsiz)
 		knc_flush(ctx, KNC_DIR_SEND, 0);
 
+	if (knc_error(ctx)) {
+		errno = ctx->errnum ? ctx->errnum : EIO; /* XXXnico: ... */
+		return 0;
+	}
+
 	return ret;
 }
 
@@ -2420,8 +2499,7 @@ knc_syscall_error(knc_ctx ctx, const char *str, int number)
 	char	*errstr;
 	char	*tmp;
 
-	/* XXXrcd: wrong type */
-	ctx->error = KNC_ERROR_GSS;
+	ctx->error = KNC_ERROR_GENERIC;
 
 	errstr = strerror(number);
 	tmp = malloc(strlen(str) + strlen(errstr) + 3);
@@ -2430,6 +2508,21 @@ knc_syscall_error(knc_ctx ctx, const char *str, int number)
 		sprintf(tmp, "%s: %s", str, errstr);
 
 	ctx->errstr = tmp;
+}
+
+static void
+knc_nomem(knc_ctx ctx)
+{
+    knc_syscall_error(ctx, "Out of memory", ENOMEM);
+}
+
+static int
+knc_stream_error(knc_ctx ctx, struct knc_stream *s)
+{
+	if (!s->errnum)
+		return 0;
+	knc_syscall_error(ctx, s->failed_func, s->errnum);
+	return ctx->error;
 }
 
 static void
