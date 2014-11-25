@@ -71,11 +71,12 @@ void		knc_set_opt(knc_ctx, unsigned, int);
  * XXXrcd: is this a meaningful distinction?
  */
 
-#define	KNC_SOCK_NONBLOCK	0x0001
-#define	KNC_SOCK_CLOEXEC	0x0002
-#define KNC_OPT_NOPRIVACY	0x0004
-#define	KNC_OPT_NOPRIVATE	KNC_OPT_NOPRIVACY
-#define KNC_OPT_SENDCMDS	0x0008
+#define	KNC_SOCK_NONBLOCK		0x0001
+#define	KNC_SOCK_CLOEXEC		0x0002
+#define KNC_OPT_NOPRIVACY		0x0004
+#define	KNC_OPT_NOPRIVATE		KNC_OPT_NOPRIVACY
+#define KNC_OPT_SENDCMDS		0x0008
+#define KNC_OPT_PROC_CTX_TOK_WORKS	0x0009
 
 /* The following options are ints rather than boolean */
 
