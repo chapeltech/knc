@@ -281,6 +281,16 @@ class KNCExecTests(unittest.TestCase):
         with open(path, "r", encoding="utf-8") as f:
             return [json.loads(line) for line in f if line.strip()]
 
+    def read_unix_prelude(self, conn):
+        buf = b""
+        while b"END\n" not in buf:
+            chunk = conn.recv(4096)
+            if not chunk:
+                raise EOFError("EOF before END")
+            buf += chunk
+        prelude, rest = buf.split(b"END\n", 1)
+        return prelude.decode("utf-8").splitlines(), rest
+
     def server_env(self):
         env = os.environ.copy()
         env["KRB5_CONFIG"] = self.krb5_conf
@@ -368,12 +378,21 @@ class KNCExecTests(unittest.TestCase):
             )
         return proc, port
 
-    def client_argv(self, port, client_opts=()):
+    def client_argv(self, port, client_opts=(), hostservice="host@127.0.0.1"):
         return [
             self.knc,
         ] + list(client_opts) + [
-            "host@127.0.0.1",
+            hostservice,
             str(port),
+        ]
+
+    def client_argv_with_network_fd(self, fd, client_opts=(),
+                                    hostservice="host@127.0.0.1"):
+        return [
+            self.knc,
+        ] + list(client_opts) + [
+            "-N", str(fd),
+            hostservice,
         ]
 
     def finish_server(self, server):
@@ -396,16 +415,41 @@ class KNCExecTests(unittest.TestCase):
         return stdout, stderr
 
     def run_client(self, port, input_data=b"", client_opts=(), env=None,
-                   timeout=KNC_TIMEOUT):
+                   timeout=KNC_TIMEOUT, hostservice="host@127.0.0.1"):
         if env is None:
             env = self.client_env()
         client = subprocess.Popen(
-            self.client_argv(port, client_opts),
+            self.client_argv(port, client_opts, hostservice),
             env=env,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
+        try:
+            cout, cerr = client.communicate(input_data, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            client.kill()
+            cout, cerr = client.communicate()
+            self.fail("client timed out\nstdout:\n%s\nstderr:\n%s" %
+                      (cout.decode("utf-8", "replace"),
+                       cerr.decode("utf-8", "replace")))
+        return client.returncode, cout, cerr
+
+    def run_client_with_wrapped_network_fd(self, port, input_data=b"",
+                                           client_opts=(),
+                                           timeout=KNC_TIMEOUT,
+                                           hostservice="host@127.0.0.1"):
+        net = socket.create_connection(("127.0.0.1", port))
+        fd = net.fileno()
+        client = subprocess.Popen(
+            self.client_argv_with_network_fd(fd, client_opts, hostservice),
+            env=self.client_env(),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            pass_fds=(fd,),
+        )
+        net.close()
         try:
             cout, cerr = client.communicate(input_data, timeout=timeout)
         except subprocess.TimeoutExpired:
@@ -588,6 +632,129 @@ class KNCExecTests(unittest.TestCase):
         self.assertEqual(out, b"one:alphatwo:beta")
         self.assertEqual(self.read_json(side), {"rest": ""})
 
+    def test_client_wraps_existing_network_fd_with_N(self):
+        side = self.side_path("wrapped_network_fd.jsonl")
+        server, port = self.start_server("connection_marker", side)
+        try:
+            payload = b"wrapped network fd"
+            returncode, out, err = self.run_client_with_wrapped_network_fd(
+                port, payload)
+            self.assertEqual(
+                returncode, 0,
+                "client failed\nstdout:\n%s\nstderr:\n%s" %
+                (out.decode("utf-8", "replace"),
+                 err.decode("utf-8", "replace"))
+            )
+            self.assertEqual(out, b"conn:" + payload)
+            self.finish_server(server)
+            records = self.read_json_lines(side)
+            self.assertEqual(len(records), 1)
+            self.assertEqual(
+                base64.b64decode(records[0]["data"].encode("ascii")),
+                payload,
+            )
+        finally:
+            if server.poll() is None:
+                server.terminate()
+                try:
+                    server.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    server.kill()
+                    server.wait()
+
+    def test_client_explicit_principal_with_P(self):
+        side = self.side_path("explicit_principal.jsonl")
+        server, port = self.start_server("connection_marker", side)
+        try:
+            payload = b"explicit principal"
+            returncode, out, err = self.run_client(
+                port, payload,
+                client_opts=["-P", SERVER_PRINC],
+                hostservice="notservice@127.0.0.1")
+            self.assertEqual(
+                returncode, 0,
+                "client failed\nstdout:\n%s\nstderr:\n%s" %
+                (out.decode("utf-8", "replace"),
+                 err.decode("utf-8", "replace"))
+            )
+            self.assertEqual(out, b"conn:" + payload)
+            self.finish_server(server)
+            records = self.read_json_lines(side)
+            self.assertEqual(len(records), 1)
+            self.assertEqual(
+                base64.b64decode(records[0]["data"].encode("ascii")),
+                payload,
+            )
+        finally:
+            if server.poll() is None:
+                server.terminate()
+                try:
+                    server.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    server.kill()
+                    server.wait()
+
+    def test_client_and_server_request_krb5_mechanism_with_m(self):
+        side = self.side_path("requested_krb5_mech.jsonl")
+        opts = ["-m", "krb5"]
+        server, port = self.start_server(
+            "connection_marker", side, server_opts=opts)
+        try:
+            payload = b"requested krb5 mechanism"
+            returncode, out, err = self.run_client(
+                port, payload, client_opts=opts)
+            self.assertEqual(
+                returncode, 0,
+                "client failed\nstdout:\n%s\nstderr:\n%s" %
+                (out.decode("utf-8", "replace"),
+                 err.decode("utf-8", "replace"))
+            )
+            self.assertEqual(out, b"conn:" + payload)
+            self.finish_server(server)
+            records = self.read_json_lines(side)
+            self.assertEqual(len(records), 1)
+            self.assertEqual(
+                base64.b64decode(records[0]["data"].encode("ascii")),
+                payload,
+            )
+        finally:
+            if server.poll() is None:
+                server.terminate()
+                try:
+                    server.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    server.kill()
+                    server.wait()
+
+    def test_client_stdio_mode_relays_without_local_program(self):
+        side = self.side_path("client_stdio.jsonl")
+        server, port = self.start_server("connection_marker", side)
+        try:
+            payload = b"client stdio relay"
+            returncode, out, err = self.run_client(port, payload)
+            self.assertEqual(
+                returncode, 0,
+                "client failed\nstdout:\n%s\nstderr:\n%s" %
+                (out.decode("utf-8", "replace"),
+                 err.decode("utf-8", "replace"))
+            )
+            self.assertEqual(out, b"conn:" + payload)
+            self.finish_server(server)
+            records = self.read_json_lines(side)
+            self.assertEqual(len(records), 1)
+            self.assertEqual(
+                base64.b64decode(records[0]["data"].encode("ascii")),
+                payload,
+            )
+        finally:
+            if server.poll() is None:
+                server.terminate()
+                try:
+                    server.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    server.kill()
+                    server.wait()
+
     def test_exec_client_half_close_still_permits_child_response(self):
         data = b"half-close request"
         side, out, _, _, _ = self.run_session("client_half_close", data)
@@ -669,13 +836,7 @@ class KNCExecTests(unittest.TestCase):
             try:
                 conn, _ = listener.accept()
                 with conn:
-                    buf = b""
-                    while b"END\n" not in buf:
-                        chunk = conn.recv(4096)
-                        if not chunk:
-                            raise EOFError("EOF before END")
-                        buf += chunk
-                    prelude, rest = buf.split(b"END\n", 1)
+                    prelude, rest = self.read_unix_prelude(conn)
                     data = [rest]
                     while True:
                         chunk = conn.recv(8192)
@@ -684,7 +845,7 @@ class KNCExecTests(unittest.TestCase):
                         data.append(chunk)
                     payload = b"".join(data)
                     conn.sendall(b"unix-response:" + payload)
-                    result["prelude"] = prelude.decode("utf-8").splitlines()
+                    result["prelude"] = prelude
                     result["payload"] = base64.b64encode(payload).decode("ascii")
             except BaseException as e:
                 result["error"] = repr(e)
@@ -725,6 +886,154 @@ class KNCExecTests(unittest.TestCase):
             )
             with open(side, "w", encoding="utf-8") as f:
                 json.dump(result, f, sort_keys=True)
+        finally:
+            if server.poll() is None:
+                server.terminate()
+                try:
+                    server.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    server.kill()
+                    server.wait()
+            thread.join(2)
+            listener.close()
+
+    def test_unix_socket_daemon_eof_still_allows_client_input(self):
+        unix_path = self.side_path("knc-eof-first.sock")
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(unix_path)
+        listener.listen(1)
+        result = {}
+
+        def unix_worker():
+            try:
+                conn, _ = listener.accept()
+                with conn:
+                    prelude, rest = self.read_unix_prelude(conn)
+                    conn.sendall(b"daemon-eof")
+                    conn.shutdown(socket.SHUT_WR)
+                    data = [rest]
+                    while True:
+                        chunk = conn.recv(8192)
+                        if not chunk:
+                            break
+                        data.append(chunk)
+                    payload = b"".join(data)
+                    result["prelude"] = prelude
+                    result["payload"] = base64.b64encode(payload).decode("ascii")
+            except BaseException as e:
+                result["error"] = repr(e)
+            finally:
+                listener.close()
+
+        thread = threading.Thread(target=unix_worker)
+        thread.start()
+        server, port = self.start_unix_socket_server(unix_path)
+        client = None
+        try:
+            payload = b"client data after daemon eof"
+            client = subprocess.Popen(
+                self.client_argv(port),
+                env=self.client_env(),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            out = self.read_exact_from(client.stdout.fileno(), len(b"daemon-eof"))
+            self.assertEqual(out, b"daemon-eof")
+            readable, _, _ = select.select([client.stdout.fileno()], [], [], 2)
+            self.assertTrue(readable, "client stdout did not receive daemon EOF")
+            self.assertEqual(os.read(client.stdout.fileno(), 1), b"")
+
+            client.stdin.write(payload)
+            client.stdin.close()
+            client.stdin = None
+            rest, err = client.communicate(timeout=KNC_TIMEOUT)
+            self.assertEqual(rest, b"")
+            self.assertEqual(
+                client.returncode, 0,
+                "client failed\nstdout:\n%s\nstderr:\n%s" %
+                (rest.decode("utf-8", "replace"),
+                 err.decode("utf-8", "replace"))
+            )
+            self.finish_server(server)
+            thread.join(KNC_TIMEOUT)
+            self.assertFalse(thread.is_alive())
+            self.assertNotIn("error", result)
+            self.assertEqual(
+                base64.b64decode(result["payload"].encode("ascii")),
+                payload,
+            )
+        finally:
+            if client is not None and client.poll() is None:
+                if client.stdin is not None:
+                    client.stdin.close()
+                client.kill()
+                client.wait()
+            if server.poll() is None:
+                server.terminate()
+                try:
+                    server.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    server.kill()
+                    server.wait()
+            thread.join(2)
+            listener.close()
+
+    def test_unix_socket_no_half_close_drops_daemon_response_after_client_eof(self):
+        unix_path = self.side_path("knc-no-half-close.sock")
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(unix_path)
+        listener.listen(1)
+        result = {}
+
+        def unix_worker():
+            try:
+                conn, _ = listener.accept()
+                with conn:
+                    _, rest = self.read_unix_prelude(conn)
+                    data = [rest]
+                    while True:
+                        chunk = conn.recv(8192)
+                        if not chunk:
+                            break
+                        data.append(chunk)
+                    payload = b"".join(data)
+                    status = "not-written"
+                    try:
+                        conn.sendall(b"late-unix-response:" + payload)
+                        status = "written"
+                    except BrokenPipeError:
+                        status = "broken-pipe"
+                    result["payload"] = base64.b64encode(payload).decode("ascii")
+                    result["write_status"] = status
+            except BaseException as e:
+                result["error"] = repr(e)
+            finally:
+                listener.close()
+
+        thread = threading.Thread(target=unix_worker)
+        thread.start()
+        opts = ["-o", "no-half-close"]
+        server, port = self.start_unix_socket_server(unix_path, server_opts=opts)
+        try:
+            payload = b"unix no half close"
+            returncode, out, err = self.run_client(port, payload, client_opts=opts)
+            self.assertEqual(
+                returncode, 0,
+                "client failed\nstdout:\n%s\nstderr:\n%s" %
+                (out.decode("utf-8", "replace"),
+                 err.decode("utf-8", "replace"))
+            )
+            self.assertEqual(out, b"")
+            self.finish_server(server)
+            thread.join(KNC_TIMEOUT)
+            self.assertFalse(thread.is_alive())
+            self.assertNotIn("error", result)
+            self.assertEqual(
+                base64.b64decode(result["payload"].encode("ascii")),
+                payload,
+            )
+            self.assertIn(result["write_status"], ["written", "broken-pipe"])
         finally:
             if server.poll() is None:
                 server.terminate()
