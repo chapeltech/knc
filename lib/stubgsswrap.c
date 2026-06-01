@@ -9,6 +9,8 @@ gss_wrap(OM_uint32 *min, gss_const_ctx_id_t ctx, int conf_req_flag,
 
 	len = (uint32_t)in->length;
 
+	if (len > SIZE_MAX - sizeof(len))
+		return GSS_S_FAILURE;
 	out->value = malloc(len + sizeof(len));
 	out->length = len + sizeof(len);
 	memcpy((char *)out->value + sizeof(len), in->value, len);
