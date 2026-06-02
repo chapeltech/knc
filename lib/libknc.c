@@ -250,7 +250,7 @@ static size_t	stream_avail(stream);
 static void	stream_garbage_collect(stream);
 
 static int	socket_options(int, int);
-static size_t	read_packet(stream, void **b);
+static size_t	read_packet(knc_ctx, stream, void **b);
 static size_t	put_packet(knc_ctx, gss_buffer_t);
 static size_t	wrap_and_put_packet(knc_ctx, char *, size_t);
 
@@ -916,10 +916,13 @@ stream_garbage_collect(stream s)
 	s->collecting = 0;
 }
 
+#define KNC_MAX_PACKET_SLOP	512
+
 static size_t
-read_packet(stream s, void **buf)
+read_packet(knc_ctx ctx, stream s, void **buf)
 {
 	size_t		 len;
+	size_t		 maxlen;
 	uint32_t	 wirelen;
 	void		*tmp;
 
@@ -929,8 +932,14 @@ read_packet(stream s, void **buf)
 		return 0;
 
 	wirelen = ntohl(*((uint32_t *)tmp));
+	maxlen = ctx->sendmax + KNC_MAX_PACKET_SLOP;
 
 	DEBUG((NULL, "read_packet: got wirelen = %u\n", wirelen));
+	if (wirelen > maxlen) {
+		knc_proto_error(ctx, "Ridiculous packet length");
+		return 0;
+	}
+
 	if (stream_avail(s) < (size_t)wirelen + 4)
 		return 0;
 
@@ -1887,7 +1896,7 @@ knc_state_process_in(knc_ctx ctx)
 	 */
 
 	for (;;) {
-		len = read_packet(&ctx->raw_recv, &buf);
+		len = read_packet(ctx, &ctx->raw_recv, &buf);
 
 		knc_debugf(ctx, "read_packet returned %zd\n", len);
 
