@@ -1018,7 +1018,7 @@ knc_ctx_init(void)
 	ret->locally_initiated	= 0;
 
 	ret->recvinbufsiz = 16384;
-	ret->sendinbufsiz = 16384;
+	ret->sendinbufsiz = 65536;
 	ret->sendmax      = 65536;
 	ret->gssmaxpacket = 65536;
 
@@ -2894,6 +2894,7 @@ int
 knc_fill(knc_ctx ctx, int dir)
 {
 	ssize_t	  len;
+	size_t	  wanted;
 	void	 *tmpbuf;
 	ssize_t	(*ourread)(void *, void *, size_t);
 	void	 *ourcookie;
@@ -2905,9 +2906,11 @@ knc_fill(knc_ctx ctx, int dir)
 	if (dir == KNC_DIR_SEND) {
 		ourread   =  ctx->localread;
 		ourcookie =  ctx->localcookie;
+		wanted	  =  MIN(ctx->gssmaxpacket, ctx->sendinbufsiz);
 	} else {
 		ourread   = ctx->netread;
 		ourcookie = ctx->netcookie;
+		wanted	  = ctx->recvinbufsiz;
 	}
 
 	/* XXXrcd: deal properly with EOF */
@@ -2917,8 +2920,7 @@ knc_fill(knc_ctx ctx, int dir)
 	if (!ourread || !ourcookie)
 		return EINVAL;
 
-	/* XXXrcd: hardcoded constant */
-	len = knc_get_ibuf(ctx, dir, &tmpbuf, 16 * 1024);
+	len = knc_get_ibuf(ctx, dir, &tmpbuf, wanted);
 	if (!len) {
 		knc_enomem(ctx);
 		return ENOMEM;
