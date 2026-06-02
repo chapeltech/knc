@@ -43,6 +43,9 @@ Makefile.in
 /test/test-suite.log
 /test/testknc
 /test/unit
+/test/unit-eof
+/test/unit-eof.log
+/test/unit-eof.trs
 /test/unit-simple
 /test/unit-pollfds
 /test/unit-pollfds.log
