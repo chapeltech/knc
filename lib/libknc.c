@@ -1075,7 +1075,7 @@ knc_ctx_init(void)
 	ret->recvinbufsiz = 16384;
 	ret->sendinbufsiz = 16384;
 	ret->sendmax      = 65536;
-	ret->gssmaxpacket = 8192;
+	ret->gssmaxpacket = 65536;
 
 	ret->raw_recv.bits_table    = ((uint32_t)1 << NUM_STREAM_BITS) - 1;
 	ret->raw_send.bits_table    = ((uint32_t)1 << NUM_STREAM_BITS) - 1;
