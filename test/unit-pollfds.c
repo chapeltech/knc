@@ -28,8 +28,9 @@
 #include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <unistd.h>
 
-#include <libknc.h>
+#include "../lib/libknc.c"
 
 static void
 check(int condition, const char *message)
@@ -41,8 +42,8 @@ check(int condition, const char *message)
 	}
 }
 
-int
-main(void)
+static void
+test_fd_zero_is_pollable(void)
 {
 	knc_callback	cbs[4];
 	struct pollfd	fds[4];
@@ -65,6 +66,159 @@ main(void)
 
 	check(found, "network read fd 0 was not returned by knc_get_pollfds");
 	knc_ctx_destroy(ctx);
+}
+
+static void
+test_pollhup_services_local_read(void)
+{
+	knc_callback	cbs[4];
+	struct pollfd	fds[4];
+	knc_ctx		ctx;
+	nfds_t		nfds;
+	nfds_t		i;
+	int		pipefds[2];
+	int		found;
+
+	check(pipe(pipefds) == 0, "pipe failed");
+	close(pipefds[1]);
+
+	ctx = knc_ctx_init();
+	check(ctx != NULL, "knc_ctx_init failed");
+	ctx->state = STATE_SESSION;
+
+	knc_set_local_fds(ctx, pipefds[0], -1);
+	nfds = knc_get_pollfds(ctx, fds, cbs, 4);
+
+	found = 0;
+	for (i = 0; i < nfds; i++) {
+		if (fds[i].fd == pipefds[0] && (fds[i].events & POLLIN)) {
+			fds[i].revents = POLLHUP;
+			found = 1;
+		} else
+			fds[i].revents = 0;
+	}
+
+	check(found, "local read fd was not returned by knc_get_pollfds");
+	knc_service_pollfds(ctx, fds, cbs, nfds);
+	check(!knc_error(ctx), "POLLHUP service set an error");
+	check(knc_pending(ctx, KNC_DIR_SEND) == 1,
+	    "POLLHUP did not queue local read EOF");
+
+	close(pipefds[0]);
+	knc_ctx_destroy(ctx);
+}
+
+static void
+test_pollerr_services_local_read(void)
+{
+	knc_callback	cbs[4];
+	struct pollfd	fds[4];
+	knc_ctx		ctx;
+	nfds_t		nfds;
+	nfds_t		i;
+	int		pipefds[2];
+	int		found;
+
+	check(pipe(pipefds) == 0, "pipe failed");
+	close(pipefds[1]);
+
+	ctx = knc_ctx_init();
+	check(ctx != NULL, "knc_ctx_init failed");
+	ctx->state = STATE_SESSION;
+
+	knc_set_local_fds(ctx, pipefds[0], -1);
+	nfds = knc_get_pollfds(ctx, fds, cbs, 4);
+
+	found = 0;
+	for (i = 0; i < nfds; i++) {
+		if (fds[i].fd == pipefds[0] && (fds[i].events & POLLIN)) {
+			fds[i].revents = POLLERR;
+			found = 1;
+		} else
+			fds[i].revents = 0;
+	}
+
+	check(found, "local read fd was not returned by knc_get_pollfds");
+	knc_service_pollfds(ctx, fds, cbs, nfds);
+	check(!knc_error(ctx), "POLLERR service set an error");
+	check(knc_pending(ctx, KNC_DIR_SEND) == 1,
+	    "POLLERR did not queue local read EOF");
+
+	close(pipefds[0]);
+	knc_ctx_destroy(ctx);
+}
+
+static void
+test_pollnval_services_local_read_error(void)
+{
+	knc_callback	cbs[4];
+	struct pollfd	fds[4];
+	knc_ctx		ctx;
+	nfds_t		nfds;
+	nfds_t		i;
+	int		pipefds[2];
+	int		found;
+
+	check(pipe(pipefds) == 0, "pipe failed");
+
+	ctx = knc_ctx_init();
+	check(ctx != NULL, "knc_ctx_init failed");
+	ctx->state = STATE_SESSION;
+
+	knc_set_local_fds(ctx, pipefds[0], -1);
+	nfds = knc_get_pollfds(ctx, fds, cbs, 4);
+
+	found = 0;
+	for (i = 0; i < nfds; i++) {
+		if (fds[i].fd == pipefds[0] && (fds[i].events & POLLIN)) {
+			fds[i].revents = POLLNVAL;
+			found = 1;
+		} else
+			fds[i].revents = 0;
+	}
+
+	close(pipefds[0]);
+	close(pipefds[1]);
+
+	check(found, "local read fd was not returned by knc_get_pollfds");
+	knc_service_pollfds(ctx, fds, cbs, nfds);
+	check(knc_error(ctx), "POLLNVAL service did not set an error");
+
+	knc_ctx_destroy(ctx);
+}
+
+static void
+test_local_fds_are_hidden_before_authentication(void)
+{
+	knc_callback	cbs[4];
+	struct pollfd	fds[4];
+	knc_ctx		ctx;
+	nfds_t		nfds;
+	int		pipefds[2];
+
+	check(pipe(pipefds) == 0, "pipe failed");
+
+	ctx = knc_ctx_init();
+	check(ctx != NULL, "knc_ctx_init failed");
+
+	knc_set_local_fds(ctx, pipefds[0], pipefds[1]);
+	nfds = knc_get_pollfds(ctx, fds, cbs, 4);
+	check(nfds == 0, "unauthenticated local fds were returned");
+
+	close(pipefds[0]);
+	close(pipefds[1]);
+	knc_ctx_destroy(ctx);
+}
+
+int
+main(void)
+{
+
+	test_fd_zero_is_pollable();
+	test_local_fds_are_hidden_before_authentication();
+	test_pollhup_services_local_read();
+	test_pollerr_services_local_read();
+	test_pollnval_services_local_read_error();
 
 	return 0;
 }

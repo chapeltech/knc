@@ -56,46 +56,19 @@ typedef struct prefs_s {
 
 extern prefs_t prefs;
 
-/* Simple input/output buffering */
-typedef struct write_buffer_s {
-	char			in[GSTD_MAXPACKETCONTENTS];
-	char			in_valid;
-	size_t			in_len;
-	char			out[2 * GSTD_MAXPACKETCONTENTS + 4];
-	char			out_valid;
-	int			out_pos;
-	size_t			out_len;
-} write_buffer_t;
-
-
 /* Connection specific data */
 typedef struct work_s {
 	/* The other side of our connection */
-	int			network_fd;
 	int			network_family;
 	char 			network_addr[MAXADDRSIZ];
 	char 			network_port[MAXPORTSIZ];
 
-	/* stdin/stdout of local side */
-	int			local_in;
-	int			local_out;
-
 	/* stderr of local side */
 	int			local_err;
-
-	/* Write buffers */
-	write_buffer_t		local_buffer;
-	write_buffer_t		network_buffer;
 
 	char *			credentials;
 	char *			export_name;
 	char *			mech;
-	void *			context;
-
-	/* for clients */
-	char *			service;
-	char *			hostname;
-	char *			sprinc;
 } work_t;
 
 const char *vlog(const char *, ...);

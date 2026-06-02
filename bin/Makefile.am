@@ -5,9 +5,10 @@ AM_CPPFLAGS = $(HARDEN_CPPFLAGS) $(GSSAPI_CFLAGS) \
 
 bin_PROGRAMS = knc
 
-knc_SOURCES = knc.c gssstdio.c
+knc_SOURCES = knc.c
+knc_CPPFLAGS = $(AM_CPPFLAGS) -DUSE_LIBKNC -I$(top_srcdir)/lib
 knc_CFLAGS = $(WFLAGS) $(HARDEN_CFLAGS) $(HARDEN_PIE_CFLAGS)
 knc_LDFLAGS = $(HARDEN_LDFLAGS) $(HARDEN_PIE_LDFLAGS)
-knc_LDADD = $(GSSAPI_LIBS)
+knc_LDADD = ../lib/libknc.la $(GSSAPI_LIBS)
 
 man_MANS = knc.1

@@ -38,6 +38,7 @@
 #include <inttypes.h>
 #include <limits.h>
 #include <netdb.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -49,7 +50,7 @@
 #include <unistd.h>
 
 #include "config.h"
-#include "gssstdio.h"
+#include <libknc.h>
 #include "knc.h"
 
 prefs_t prefs;
@@ -65,30 +66,42 @@ int	connect_host_dosrv(const char *, const char *);
 int	connect_host_inner(const char *, const char *);
 int	reap(void);
 int	getport(const char *, const char *);
-int	launch_program(work_t *, int, char **);
+int	launch_program(knc_ctx, work_t *, int, char **);
 int	prep_inetd(void);
 int	do_inetd(int, char **);
 int	do_inetd_wait(int, char **);
 int	do_listener_inet(int, char **);
 int	do_listener(int, int, char **);
-int	do_unix_socket(work_t *);
-int	fork_and_do_unix_socket(work_t *, int);
+int	do_unix_socket(knc_ctx);
+int	fork_and_do_unix_socket(work_t *, int, int);
 int	do_client(int, char **);
-int	send_creds(int, work_t *, const char *const, const char * const);
-int	emit_key_value(work_t *, const char * const, const char * const);
-int	setenv_knc_key_value(const char * const, const char * const);
-int	do_work(work_t *, int, char **);
-int	fork_and_do_work(work_t *, int, int, char **);
-int	move_local_to_network_buffer(work_t *);
-int	move_network_to_local_buffer(work_t *);
-void	write_buffer_init(write_buffer_t *);
+int	send_creds(knc_ctx, int, const char *const, const char * const);
+int	emit_key_value(int, const char * const, const char * const);
+int	putenv_knc_key_value(const char * const, const char * const);
+int	do_work(knc_ctx, work_t *, int, char **);
+int	fork_and_do_work(work_t *, int, int, int, char **);
 void	work_init(work_t *);
 void	work_free(work_t *);
-void	work_close_fd(work_t *, int);
 int	shutdown_or_close(int, int);
 int	nonblocking_set(int);
 int	nonblocking_clr(int);
 void	sockaddr_2str(work_t *, const struct sockaddr *, socklen_t);
+static knc_ctx	 app_ctx_init(void);
+static char	*app_display_name(gss_name_t);
+static char	*app_export_name(gss_name_t);
+static gss_OID	 app_mech_from_name(const char *);
+static char	*app_mech_name(gss_OID);
+static int	 app_oid_equal(gss_OID, gss_OID);
+static char	*app_oid_to_hex(gss_OID);
+static int	 attach_local_fds(knc_ctx, int, int);
+static int	 attach_net_fd(knc_ctx, int, int);
+static int	 authenticate_client(knc_ctx);
+static int	 authenticate_server(knc_ctx, work_t *);
+static int	 configure_network(knc_ctx, int);
+static int	 close_net_fds(knc_ctx);
+static int	 log_stderr(work_t *);
+static int	 parse_client_target(const char *, char **, char **);
+static ssize_t	 write_full(int, const void *, size_t);
 
 /* END_DECLS */
 
@@ -394,7 +407,7 @@ main(int argc, char **argv)
 			}
 			break;
 		case 'm':
-			global_mech = gstd_mech_from_name(optarg);
+			global_mech = app_mech_from_name(optarg);
 			if (!global_mech) {
 				fprintf(stderr, "Invalid mech \"%s\".\n", optarg);
 				usage(argv[0]);
@@ -757,32 +770,266 @@ setup_listener(unsigned short int port)
 	return fd;
 }
 
-int
-handshake(work_t *work)
+static char *
+app_buf_to_hex(const void *buf, size_t len)
 {
+	const unsigned char	*bufp = buf;
+	unsigned char		 nibble;
+	char			*ret;
+	size_t			 i;
+	size_t			 k;
 
-	if (prefs.is_listener) {
-		if ((work->context = gstd_accept(work->network_fd,
-					 &work->credentials,
-					 &work->export_name,
-					 &work->mech)) == NULL)
-			return 0;
-		else
-			return 1;
-	} else {
-		if ((work->context = gstd_initiate(work->hostname,
-						   work->service,
-						   work->sprinc,
-						   work->network_fd)) == NULL)
-			return 0;
-		else
-			return 1;
+	if (buf == NULL)
+		return xstrdup("");
+
+	ret = malloc(len * 2 + 1);
+	if (!ret) {
+		LOG(LOG_ERR, ("unable to malloc"));
+		return NULL;
 	}
 
-	/* NOTREACHED */
-	return 0;
+	for (i = 0, k = 0; i < len; i++) {
+		nibble = bufp[i] >> 4;
+		ret[k++] = "0123456789ABCDEF"[nibble];
+		nibble = bufp[i] & 0x0f;
+		ret[k++] = "0123456789ABCDEF"[nibble];
+	}
+
+	ret[k] = '\0';
+	return ret;
 }
 
+static char *
+app_oid_to_hex(gss_OID oid)
+{
+
+	if (oid == GSS_C_NO_OID || oid->elements == NULL)
+		return xstrdup("");
+
+	return app_buf_to_hex(oid->elements, oid->length);
+}
+
+#define KNC_KRB5_MECH_OID "\052\206\110\206\367\022\001\002\002"
+
+static gss_OID_desc krb5_mech_oid = {
+	sizeof(KNC_KRB5_MECH_OID) - 1,
+	(void *)KNC_KRB5_MECH_OID
+};
+
+static int
+app_oid_equal(gss_OID a, gss_OID b)
+{
+
+	return a != GSS_C_NO_OID && b != GSS_C_NO_OID &&
+	    a->length == b->length &&
+	    memcmp(a->elements, b->elements, a->length) == 0;
+}
+
+static gss_OID
+app_mech_from_name(const char *name)
+{
+
+	if (name == NULL || *name == '\0')
+		return GSS_C_NO_OID;
+
+#ifdef HAVE_GSS_NAME_TO_OID
+	{
+		gss_OID	oid;
+
+		oid = gss_name_to_oid(name);
+		if (oid != GSS_C_NO_OID)
+			return oid;
+	}
+#endif
+
+	if (strcasecmp(name, "krb5") == 0 ||
+	    strcasecmp(name, "kerberos") == 0 ||
+	    strcasecmp(name, "kerberos5") == 0)
+		return &krb5_mech_oid;
+
+	return GSS_C_NO_OID;
+}
+
+static char *
+app_mech_name(gss_OID mech_oid)
+{
+	char	*ret;
+
+	if (app_oid_equal(mech_oid, &krb5_mech_oid))
+		return xstrdup("krb5");
+
+#ifdef HAVE_GSS_OID_TO_NAME
+	{
+		const char *name = gss_oid_to_name(mech_oid);
+
+		if (name != NULL)
+			return xstrdup(name);
+	}
+#endif
+
+	ret = app_oid_to_hex(mech_oid);
+	if (!ret)
+		LOG(LOG_ERR, ("unable to malloc"));
+	return ret;
+}
+
+static char *
+app_display_name(gss_name_t name)
+{
+	gss_buffer_desc	 buf;
+	OM_uint32	 maj;
+	OM_uint32	 min;
+	char		*ret;
+
+	if (name == GSS_C_NO_NAME)
+		return NULL;
+
+	maj = gss_display_name(&min, name, &buf, NULL);
+	if (GSS_ERROR(maj)) {
+		LOG(LOG_ERR, ("gss_display_name failed"));
+		return NULL;
+	}
+
+	ret = malloc(buf.length + 1);
+	if (ret == NULL) {
+		LOG(LOG_ERR, ("unable to malloc"));
+		gss_release_buffer(&min, &buf);
+		return NULL;
+	}
+
+	memcpy(ret, buf.value, buf.length);
+	ret[buf.length] = '\0';
+
+	gss_release_buffer(&min, &buf);
+	return ret;
+}
+
+static char *
+app_export_name(gss_name_t name)
+{
+	gss_buffer_desc	 buf;
+	OM_uint32	 maj;
+	OM_uint32	 min;
+	char		*ret;
+
+	if (name == GSS_C_NO_NAME)
+		return NULL;
+
+	maj = gss_export_name(&min, name, &buf);
+	if (GSS_ERROR(maj)) {
+		LOG(LOG_ERR, ("gss_export_name failed"));
+		return NULL;
+	}
+
+	ret = app_buf_to_hex(buf.value, buf.length);
+	gss_release_buffer(&min, &buf);
+	return ret;
+}
+
+static int
+configure_network(knc_ctx ctx, int linger)
+{
+	struct linger	l;
+	int		fd;
+
+	fd = knc_get_net_wfd(ctx);
+	if (fd == -1)
+		fd = knc_get_net_rfd(ctx);
+	if (fd == -1) {
+		LOG(LOG_ERR, ("network fd was not initialised"));
+		return 0;
+	}
+
+	if (linger) {
+		l.l_onoff = 1;
+		l.l_linger = 10;
+		if (setsockopt(fd, SOL_SOCKET, SO_LINGER, &l, sizeof(l)) < 0) {
+			LOG_ERRNO(LOG_ERR, ("unable to set SO_LINGER on "
+			    "network socket"));
+			return 0;
+		}
+	}
+
+	if (prefs.so_keepalive) {
+		int	keepalive = 1;
+
+		if (setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &keepalive,
+			       sizeof(keepalive)) < 0) {
+			LOG_ERRNO(LOG_ERR, ("unable to set SO_KEEPALIVE on "
+			    "network socket"));
+		}
+	}
+
+	return 1;
+}
+
+static knc_ctx
+app_ctx_init(void)
+{
+	knc_ctx	ctx;
+
+	ctx = knc_ctx_init();
+	if (ctx == NULL)
+		return NULL;
+
+	knc_set_opt(ctx, KNC_OPT_NOPRIVACY, prefs.noprivacy);
+	knc_set_opt(ctx, KNC_OPT_NO_HALF_CLOSE, prefs.no_half_close);
+	knc_set_debug(ctx, prefs.debug_level >= LOG_DEBUG);
+	knc_set_req_mech(ctx, global_mech);
+
+	return ctx;
+}
+
+static int
+attach_net_fd(knc_ctx ctx, int fd, int linger)
+{
+
+	knc_give_net_fd(ctx, fd);
+	if (!configure_network(ctx, linger))
+		return 0;
+	knc_set_opt(ctx, KNC_SOCK_NONBLOCK, 1);
+	return 1;
+}
+
+static int
+authenticate_client(knc_ctx ctx)
+{
+
+	knc_set_opt(ctx, KNC_SOCK_NONBLOCK, 1);
+	knc_authenticate(ctx);
+	if (knc_error(ctx)) {
+		LOG(LOG_ERR, ("handshake with peer failed: %s",
+		    knc_errstr(ctx)));
+		return 0;
+	}
+
+	return 1;
+}
+
+static int
+authenticate_server(knc_ctx ctx, work_t *work)
+{
+	gss_name_t	client;
+
+	knc_accept(ctx);
+	knc_authenticate(ctx);
+	if (knc_error(ctx)) {
+		LOG(LOG_ERR, ("handshake with peer failed: %s",
+		    knc_errstr(ctx)));
+		return 0;
+	}
+
+	client = knc_get_client(ctx);
+	work->credentials = app_display_name(client);
+	work->export_name = app_export_name(client);
+	work->mech = app_mech_name(knc_get_ret_mech(ctx));
+	if (!work->credentials || !work->export_name || !work->mech)
+		return 0;
+
+	return 1;
+}
+
+#ifndef USE_LIBKNC
 int
 move_network_to_local_buffer(work_t *work)
 {
@@ -1072,12 +1319,70 @@ write_network_buffer(work_t *work)
 	work->network_buffer.out_pos += len;
 	return len;
 }
+#endif
 
 #define MAX(a,b)	(((a) > (b)) ? (a) : (b))
 
 int
-move_data(work_t *work)
+move_data(knc_ctx ctx, work_t *work)
 {
+#ifdef USE_LIBKNC
+	knc_callback	 cbs[5];
+	struct pollfd	 fds[5];
+	nfds_t		 knc_nfds;
+	nfds_t		 nfds;
+	int		 ret;
+	int		 stderr_idx = -1;
+
+	while (!knc_io_complete(ctx) && !knc_error(ctx)) {
+		stderr_idx = -1;
+		knc_nfds = knc_get_pollfds(ctx, fds, cbs, 4);
+		if (knc_nfds == (nfds_t)-1) {
+			LOG(LOG_ERR, ("knc_get_pollfds failed"));
+			return 0;
+		}
+		nfds = knc_nfds;
+
+		if (work->local_err != -1 && nfds < 5) {
+			stderr_idx = (int)nfds;
+			fds[nfds].fd = work->local_err;
+			fds[nfds].events = POLLIN;
+			fds[nfds].revents = 0;
+			nfds++;
+		}
+
+		if (reap() > 0)
+			LOG(LOG_NOTICE, ("child died before EOF"));
+
+		ret = poll(fds, nfds, 30000);
+		if (ret < 0) {
+			if (errno != EINTR && errno != EAGAIN) {
+				LOG_ERRNO(LOG_ERR, ("poll failure"));
+				return 0;
+			}
+			continue;
+		}
+
+		if (ret == 0) {
+			knc_garbage_collect(ctx);
+			continue;
+		}
+
+		if (stderr_idx != -1 &&
+		    (fds[stderr_idx].revents & (POLLIN|POLLHUP|POLLERR)))
+			log_stderr(work);
+
+		knc_service_pollfds(ctx, fds, cbs, knc_nfds);
+		knc_garbage_collect(ctx);
+	}
+
+	if (knc_error(ctx)) {
+		LOG(LOG_ERR, ("KNC error: %s", knc_errstr(ctx)));
+		return 0;
+	}
+
+	return 1;
+#else
 	int		ret;
 	int		mret;
 	int		select_is_the_worst_api_ever;
@@ -1331,26 +1636,109 @@ move_data(work_t *work)
 		 work->network_buffer.in_valid);
 
 	return 1;
+#endif
 }
 
-int
-send_creds(int local, work_t *work, const char *const key,
-	   const char *const value)
+static int
+attach_local_fds(knc_ctx ctx, int local_in, int local_out)
 {
 
-	if (local) {
-		if (!strcmp(key, "END"))
-			return writen(work->local_out, "END\n", 4) < 0 ? 0 : 1;
-		if (!value)
-			return 1;
-		return emit_key_value(work, key, value);
+	if (local_in == -1 || local_out == -1) {
+		LOG(LOG_ERR, ("local fds were not initialised"));
+		return 0;
 	}
 
-	return setenv_knc_key_value(key, value);
+	if (nonblocking_set(local_in) < 0) {
+		LOG_ERRNO(LOG_ERR, ("unable to set O_NONBLOCK on local"
+		    " read socket"));
+		return 0;
+	}
+
+	if (local_out != local_in && nonblocking_set(local_out) < 0) {
+		LOG_ERRNO(LOG_ERR, ("unable to set O_NONBLOCK on local"
+		    " write socket"));
+		return 0;
+	}
+
+	if (local_in == STDIN_FILENO || local_out == STDOUT_FILENO) {
+		knc_set_local_fds(ctx, local_in, local_out);
+		return 1;
+	}
+
+	if (local_in == local_out) {
+		knc_give_local_fd(ctx, local_in);
+		return 1;
+	}
+
+	knc_give_local_fds(ctx, local_in, local_out);
+	return 1;
+}
+
+static int
+close_net_fds(knc_ctx ctx)
+{
+	int	rfd;
+	int	wfd;
+
+	rfd = knc_get_net_rfd(ctx);
+	wfd = knc_get_net_wfd(ctx);
+
+	if (wfd != -1 && wfd != rfd)
+		close(wfd);
+	if (rfd != -1)
+		close(rfd);
+
+	return 1;
+}
+
+static int
+log_stderr(work_t *work)
+{
+	char	errbuf[8192];
+	int	ret;
+
+	ret = read(work->local_err, errbuf, sizeof(errbuf) - 1);
+	switch (ret) {
+	case 0:
+		/*FALLTHROUGH*/
+	case -1:
+		close(work->local_err);
+		work->local_err = -1;
+		return 1;
+	default:
+		errbuf[ret] = 0;
+		LOG(LOG_ERR, ("stderr: %s", errbuf));
+		return 1;
+	}
 }
 
 int
-emit_key_value(work_t * work, const char * const key,
+send_creds(knc_ctx ctx, int local, const char *const key,
+	   const char *const value)
+{
+	int	fd;
+
+	if (local) {
+		fd = knc_get_local_wfd(ctx);
+		if (fd == -1) {
+			LOG(LOG_ERR, ("local write fd was not initialised"));
+			return 0;
+		}
+
+		if (!value)
+			return write_full(fd, "END\n", 4) < 0 ? 0 : 1;
+
+		return emit_key_value(fd, key, value);
+	}
+
+	if (!value)
+		return 1;
+
+	return putenv_knc_key_value(key, value);
+}
+
+int
+emit_key_value(int fd, const char * const key,
 	       const char * const value)
 {
 
@@ -1373,10 +1761,10 @@ emit_key_value(work_t * work, const char * const key,
 	}
 
 	/* Write KEY:VALUE pair */
-	if ((writen(work->local_out, key, strlen(key)) < 0) ||
-	    (writen(work->local_out, ":", 1) <  0) ||
-	    (writen(work->local_out, value, strlen(value)) < 0) ||
-	    (writen(work->local_out, "\n", 1) < 0)) {
+	if ((write_full(fd, key, strlen(key)) < 0) ||
+	    (write_full(fd, ":", 1) <  0) ||
+	    (write_full(fd, value, strlen(value)) < 0) ||
+	    (write_full(fd, "\n", 1) < 0)) {
 		LOG_ERRNO(LOG_ERR, ("failed to write KEY:VALUE pair "
 				    "'%s:%s'.  connection terminated.",
 				    key, value));
@@ -1412,6 +1800,29 @@ setenv_knc_key_value(const char * const key, const char * const value)
 	return 1;
 }
 
+static ssize_t
+write_full(int fd, const void *buf, size_t len)
+{
+	const char	*p = buf;
+	size_t		 nleft = len;
+	ssize_t		 nwritten;
+
+	while (nleft > 0) {
+		nwritten = write(fd, p, nleft);
+		if (nwritten < 0) {
+			if (errno == EINTR || errno == EAGAIN)
+				continue;
+			LOG_ERRNO(LOG_ERR, ("write failed"));
+			return -1;
+		}
+		nleft -= (size_t)nwritten;
+		p += nwritten;
+	}
+
+	LOG(LOG_DEBUG, ("wrote %zu bytes", len));
+	return (ssize_t)len;
+}
+
 void
 sockaddr_2str(work_t *work, const struct sockaddr *sa, socklen_t len)
 {
@@ -1432,53 +1843,14 @@ sockaddr_2str(work_t *work, const struct sockaddr *sa, socklen_t len)
 }
 
 int
-do_work(work_t *work, int argc, char **argv)
+do_work(knc_ctx ctx, work_t *work, int argc, char **argv)
 {
 	int		ret;
-	struct linger	l;
 	int		local = 0;
 
-	/*
-	 * We now have a socket (network_fd) and soon, a local descriptor --
-	 * either from inetd or one side of a socketpair we created before
-	 * exec()ing a program (local_fd)
-	 *
-	 * We must establish what the remote end's credentials are, and
-	 * begin ferrying data to and fro.
-	 */
-	if (!handshake(work)) {
+	if (!authenticate_server(ctx, work)) {
 		LOG(LOG_ERR, ("handshake with peer failed"));
 		return 0;
-	}
-
-	/* Ensure all messages are sent before close */
-	l.l_onoff = 1;
-	l.l_linger = 10;
-	if (setsockopt(work->network_fd, SOL_SOCKET, SO_LINGER,
-		       &l, sizeof(l)) < 0) {
-		LOG_ERRNO(LOG_ERR, ("unable to set SO_LINGER on network"
-				    " socket"));
-		return 0;
-	}
-
-	/* Use non-blocking network I/O */
-	if (nonblocking_set(work->network_fd) < 0) {
-		LOG_ERRNO(LOG_ERR, ("unable to set O_NONBLOCK on network"
-				    " socket"));
-		return 0;
-	}
-
-	/* Optionally set keepalives */
-	if (prefs.so_keepalive) {
-		int	keepalive = 1;
-
-		if (setsockopt(work->network_fd, SOL_SOCKET, SO_KEEPALIVE,
-			       &keepalive, sizeof(keepalive)) < 0) {
-			LOG_ERRNO(LOG_ERR, ("unable to set SO_KEEPALIVE on "
-					    "network socket"));
-
-			/* XXXrcd: We continue on failure */
-		}
 	}
 
 	/* Now we have credentials */
@@ -1486,61 +1858,84 @@ do_work(work_t *work, int argc, char **argv)
 
 	local = !(prefs.sun_path == NULL);
 
-	/* send the credentials to our daemon side */
+	if (local) {
+		if (!do_unix_socket(ctx))
+			return 0;
+	} else {
+		/*
+		 * Environment variables must be populated before exec.
+		 */
+		if (!(send_creds(ctx, local, "MECH", work->mech)	&&
+		      (strcmp(work->mech, "krb5") != 0			||
+		       send_creds(ctx, local, "CREDS",
+		       work->credentials))				&&
+		      send_creds(ctx, local, "EXPORT_NAME",
+		       work->export_name)				&&
+		      (work->network_family != AF_INET			||
+		       send_creds(ctx, local, "REMOTE_IP",
+		       work->network_addr))				&&
+		      (work->network_family != AF_INET6			||
+		       send_creds(ctx, local, "REMOTE_IP6",
+		       work->network_addr))				&&
+		      send_creds(ctx, local, "REMOTE_ADDR",
+		       work->network_addr)				&&
+		      send_creds(ctx, local, "REMOTE_PORT",
+		       work->network_port)				&&
+		      send_creds(ctx, local, "VERSION",
+		       KNC_VERSION_STRING)				&&
+		      send_creds(ctx, local, "END", NULL))) {
+			LOG(LOG_ERR, ("Failed to propagate creds.  connection "
+				      "terminated."));
+			return 0;
+		}
 
-	/*
-	 * work->mech may be NULL if the mech OID could not be mapped.
-	 * Never strcmp a NULL mech; fail closed so we do not mis-handle
-	 * the krb5 CREDS path or send_creds(MECH, NULL).
-	 */
-	if (work->mech == NULL) {
-		LOG(LOG_ERR, ("mechanism name unavailable"));
-		return 0;
-	}
-
-	if (!(send_creds(local, work, "MECH", work->mech)		&&
-	      send_creds(local, work, "CREDS",
-		  strcmp(work->mech, "krb5") == 0 ?
-		  work->credentials : NULL)			&&
-	      send_creds(local, work, "EXPORT_NAME", work->export_name)	&&
-	      send_creds(local, work, "REMOTE_IP",
-		  work->network_family == AF_INET ?
-		  work->network_addr : NULL)			&&
-	      send_creds(local, work, "REMOTE_IP6",
-		  work->network_family == AF_INET6 ?
-		  work->network_addr : NULL)			&&
-	      send_creds(local, work, "REMOTE_ADDR", work->network_addr)&&
-	      send_creds(local, work, "REMOTE_PORT", work->network_port)&&
-	      send_creds(local, work, "VERSION", KNC_VERSION_STRING)	&&
-	      send_creds(local, work, "END", NULL))) {
-		LOG(LOG_ERR, ("Failed to propagate creds.  connection "
-			      "terminated."));
-		return 0;
-	}
-
-	/* Handle the NON - Unix domain socket case */
-	if (!local) {
+		/* Handle the non-Unix-domain-socket case. */
 		if (argc == 0) {
-			work->local_in = STDOUT_FILENO;
-			work->local_out = STDIN_FILENO;
-		} else if (!launch_program(work, argc, argv))
+			if (!attach_local_fds(ctx, STDOUT_FILENO, STDIN_FILENO))
+				return 0;
+		} else if (!launch_program(ctx, work, argc, argv))
 			exit(1);
 	}
 
-	/* Use non-blocking local writes I/O */
-	if (nonblocking_set(work->local_out) < 0) {
-		LOG_ERRNO(LOG_ERR, ("unable to set O_NONBLOCK on local"
-				    " write socket"));
-		return 0;
+	if (local) {
+		if (!(send_creds(ctx, local, "MECH", work->mech)	&&
+		      (strcmp(work->mech, "krb5") != 0			||
+		       send_creds(ctx, local, "CREDS",
+		       work->credentials))				&&
+		      send_creds(ctx, local, "EXPORT_NAME",
+		       work->export_name)				&&
+		      (work->network_family != AF_INET			||
+		       send_creds(ctx, local, "REMOTE_IP",
+		       work->network_addr))				&&
+		      (work->network_family != AF_INET6			||
+		       send_creds(ctx, local, "REMOTE_IP6",
+		       work->network_addr))				&&
+		      send_creds(ctx, local, "REMOTE_ADDR",
+		       work->network_addr)				&&
+		      send_creds(ctx, local, "REMOTE_PORT",
+		       work->network_port)				&&
+		      send_creds(ctx, local, "VERSION",
+		       KNC_VERSION_STRING)				&&
+		      send_creds(ctx, local, "END", NULL))) {
+			LOG(LOG_ERR, ("Failed to propagate creds.  connection "
+				      "terminated."));
+			return 0;
+		}
 	}
 
-	ret = move_data(work);
+	ret = move_data(ctx, work);
+
+	if (work->local_err != -1) {
+		close(work->local_err);
+		work->local_err = -1;
+	}
+	knc_ctx_destroy(ctx);
 
 	return ret;
 }
 
 int
-launch_program(work_t *work, int argc, char **argv)
+launch_program(knc_ctx ctx, work_t *work, int argc, char **argv)
 {
 	pid_t	pid;
 	int	stdin_fds[2];
@@ -1584,7 +1979,7 @@ launch_program(work_t *work, int argc, char **argv)
 	if (pid == 0) {
 		/* child */
 
-		close(work->network_fd);
+		close_net_fds(ctx);
 		close(stdin_fds[0]);
 		close(stdout_fds[0]);
 		close(prog_err[0]);
@@ -1633,15 +2028,20 @@ launch_program(work_t *work, int argc, char **argv)
 	close(stdin_fds[1]);
 	close(stdout_fds[1]);
 	close(prog_err[1]);
-	work->local_out = stdin_fds[0];
-	work->local_in = stdout_fds[0];
+	if (!attach_local_fds(ctx, stdout_fds[0], stdin_fds[0])) {
+		close(stdin_fds[0]);
+		close(stdout_fds[0]);
+		close(prog_err[0]);
+		return 0;
+	}
 	work->local_err = prog_err[0];
 	return 1;
 }
 
 int
-fork_and_do_work(work_t *work, int listener, int argc, char **argv)
+fork_and_do_work(work_t *work, int listener, int fd, int argc, char **argv)
 {
+	knc_ctx	ctx;
 	pid_t	pid;
 
 	pid = fork();
@@ -1652,7 +2052,10 @@ fork_and_do_work(work_t *work, int listener, int argc, char **argv)
 	} else if (pid == 0) {
 		/* child */
 		close(listener);
-		exit(!do_work(work, argc, argv));
+		ctx = app_ctx_init();
+		if (ctx == NULL || !attach_net_fd(ctx, fd, 1))
+			exit(1);
+		exit(!do_work(ctx, work, argc, argv));
 	}
 
 	LOG(LOG_DEBUG, ("parent returning to accept"));
@@ -1660,10 +2063,9 @@ fork_and_do_work(work_t *work, int listener, int argc, char **argv)
 }
 
 int
-do_unix_socket(work_t *work)
+do_unix_socket(knc_ctx ctx)
 {
 	int			fd;
-	int			ret;
 	struct sockaddr_un	pfun;
 
 	memset(&pfun, 0, sizeof(pfun));
@@ -1696,16 +2098,13 @@ do_unix_socket(work_t *work)
 		return 0;
 	}
 
-	work->local_in = work->local_out = fd;
-
-	ret = do_work(work, 0, 0);
-
-	return ret;
+	return attach_local_fds(ctx, fd, fd);
 }
 
 int
-fork_and_do_unix_socket(work_t *work, int listener)
+fork_and_do_unix_socket(work_t *work, int listener, int fd)
 {
+	knc_ctx	ctx;
 	pid_t	pid;
 
 	pid = fork();
@@ -1716,7 +2115,10 @@ fork_and_do_unix_socket(work_t *work, int listener)
 	} else if (pid == 0) {
 		/* child */
 		close(listener);
-		exit(!do_unix_socket(work));
+		ctx = app_ctx_init();
+		if (ctx == NULL || !attach_net_fd(ctx, fd, 1))
+			exit(1);
+		exit(!do_work(ctx, work, 0, NULL));
 	}
 
 	LOG(LOG_DEBUG, ("parent returning to accept"));
@@ -1783,26 +2185,33 @@ do_inetd_nowait(int argc, char **argv)
 	socklen_t               len;
 	int			fd;
 	int			ret;
+	knc_ctx			ctx;
  
 	work_init(&work);
 
-	work.network_fd = prep_inetd();
-	if (work.network_fd == -1)
+	fd = prep_inetd();
+	if (fd == -1)
 		return 0;
 
 	/* Obtain the remote TCP info */
 	len = sizeof(ss);
-	ret = getpeername(work.network_fd, (struct sockaddr *)&ss, &len);
+	ret = getpeername(fd, (struct sockaddr *)&ss, &len);
 	if (ret == -1) {
 		LOG(LOG_ERR, ("getpeername: %s", strerror(errno)));
 	} else {
 		sockaddr_2str(&work, (struct sockaddr *)&ss, len);
 	}
 
-	if (prefs.sun_path != NULL)
-		ret = do_unix_socket(&work);
-	else
-		ret = do_work(&work, argc, argv);
+	ctx = app_ctx_init();
+	if (ctx == NULL || !attach_net_fd(ctx, fd, 1)) {
+		if (ctx != NULL)
+			knc_ctx_destroy(ctx);
+		close(fd);
+		work_free(&work);
+		return 0;
+	}
+
+	ret = do_work(ctx, &work, argc, argv);
 
 	work_free(&work);
 
@@ -1856,6 +2265,7 @@ do_listener(int listener, int argc, char **argv)
 	time_t			 endtime = 0;
 	socklen_t		 client_len;
 	work_t			*work;
+	knc_ctx			 ctx;
 
 	sig_set(SIGHUP, sig_handler, 1);
 	sig_set(SIGCHLD, sig_handler, 1);
@@ -1904,20 +2314,38 @@ do_listener(int listener, int argc, char **argv)
 		LOG(LOG_INFO, ("Accepted connection from %s port %s",
 			       work->network_addr, work->network_port));
 
-		work->network_fd = fd;
-
 		if (prefs.sun_path != NULL) {
 			/* Connecting to a unix domain socket */
-			if (prefs.no_fork)
-				do_unix_socket(work);
-			else if (fork_and_do_unix_socket(work, listener))
+			if (prefs.no_fork) {
+				ctx = app_ctx_init();
+				if (ctx != NULL && attach_net_fd(ctx, fd, 1))
+					do_work(ctx, work, 0, NULL);
+				else if (ctx != NULL)
+					knc_ctx_destroy(ctx);
+				else
+					close(fd);
+			} else if (fork_and_do_unix_socket(work, listener, fd)) {
 				++num_children;
+				close(fd);
+			} else {
+				close(fd);
+			}
 		} else {
 			/* execing a program */
-			if (prefs.no_fork)
-				do_work(work, argc, argv);
-			else if (fork_and_do_work(work, listener, argc, argv))
+			if (prefs.no_fork) {
+				ctx = app_ctx_init();
+				if (ctx != NULL && attach_net_fd(ctx, fd, 1))
+					do_work(ctx, work, argc, argv);
+				else if (ctx != NULL)
+					knc_ctx_destroy(ctx);
+				else
+					close(fd);
+			} else if (fork_and_do_work(work, listener, fd, argc, argv)) {
 				++num_children;
+				close(fd);
+			} else {
+				close(fd);
+			}
 		}
 
 		/* The parent no longer needs this work structure. */
@@ -1942,100 +2370,99 @@ do_listener(int listener, int argc, char **argv)
 	return 0;
 }
 
+static int
+parse_client_target(const char *target, char **servicep, char **hostp)
+{
+	char	*buf;
+	char	*host;
+	char	*port;
+
+	buf = xstrdup(target);
+	host = index(buf, '@');
+	if (host == NULL) {
+		LOG(LOG_ERR, ("invalid service@host: %s", target));
+		free(buf);
+		return 0;
+	}
+
+	*host++ = '\0';
+	port = index(host, ':');
+	if (port)
+		*port = '\0';
+
+	*servicep = buf;
+	*hostp = host;
+	return 1;
+}
+
 int
 do_client(int argc, char **argv)
 {
-	char			*hostname;
 	char			*service;
 	char			*port;
-	int			 fd;
+	char			*hostname;
 	int			 ret;
 	work_t			 work;
-	struct sockaddr_in	 sa;
+	knc_ctx			 ctx;
 
-	memset(&sa, 0, sizeof(sa));
 	work_init(&work);
 
-	service = strdup(argv[0]);
-	if (!service) {
-		LOG(LOG_ERR, ("do_client: strdup failed, %s",
-		    strerror(errno)));
+	if (!parse_client_target(argv[0], &service, &hostname))
+		return 0;
+
+	port = argv[1];
+	ctx = app_ctx_init();
+	if (ctx == NULL) {
+		free(service);
 		return 0;
 	}
 
-	/* Pick out the hostname portion of service@host */
-	if ((hostname = (index(service, '@'))) == NULL) {
-		    LOG(LOG_ERR, ("invalid service@host: %s", argv[0]));
-		    free(service);
-		    return 0;
-	}
-
-	*hostname++ = '\0';
-
-	port = index(hostname, ':');
-	if (port)
-		*port++ = '\0';
-	if (argv[1])
-		port = argv[1];
-
-	/*
-	 * XXXrcd: for now, we default the port to be the service name,
-	 *         but later we should put this logic in the SRV RR
-	 *         handling code.  The idea will be: if the port isn't
-	 *         provided, then look for the SRV RRs failing back to
-	 *         use getaddrinfo(3) with service as the port.  If the
-	 *         port is provided, then avoid the SRV RR lookup.
-	 */
-
-	if (!port)
-		port = service;
-
 	if (prefs.sprinc)
-		work.sprinc = xstrdup(prefs.sprinc);
-
-	work.local_in = STDIN_FILENO;
-	work.local_out = STDOUT_FILENO;
-
-	/* work.local_err = STDERR_FILENO;*/
-	/* XXX - why doesn't this work for clients? */
-	work.local_err = -1;
+		knc_import_set_service(ctx, prefs.sprinc, GSS_C_NO_OID);
 
 	if (prefs.network_fd != -1) {
 		LOG(LOG_DEBUG, ("wrapping existing fd %d", prefs.network_fd));
-		work.network_fd = prefs.network_fd;
-	} else {
-		fd = connect_host(hostname, port);
-
-		if (fd == -1)
-			exit(1);
-
-		work.network_fd = fd;
-	}
-
-	/* Optionally set keepalives */
-	if (prefs.so_keepalive) {
-		int	keepalive = 1;
-
-		if (setsockopt(work.network_fd, SOL_SOCKET, SO_KEEPALIVE,
-			       &keepalive, sizeof(keepalive)) < 0) {
-			LOG_ERRNO(LOG_ERR, ("unable to set SO_KEEPALIVE on "
-					    "network socket"));
-
-			/* XXXrcd: We continue on failure */
+		if (!prefs.sprinc)
+			knc_import_set_hb_service(ctx, hostname, service);
+		if (!attach_net_fd(ctx, prefs.network_fd, 0)) {
+			free(service);
+			knc_ctx_destroy(ctx);
+			return 0;
 		}
+		knc_initiate(ctx);
+	} else {
+		ctx = knc_connect(ctx, argv[0], "host", port, 0);
+		if (knc_error(ctx)) {
+			LOG(LOG_ERR, ("connect failed: %s", knc_errstr(ctx)));
+			free(service);
+			knc_ctx_destroy(ctx);
+			return 0;
+		}
+		if (!configure_network(ctx, 0)) {
+			free(service);
+			knc_ctx_destroy(ctx);
+			return 0;
+		}
+		knc_set_opt(ctx, KNC_SOCK_NONBLOCK, 1);
 	}
 
-	work.hostname = xstrdup(hostname);
-	work.service = xstrdup(service);
 	free(service);
 
-	if (!handshake(&work)) {
+	if (!authenticate_client(ctx)) {
 		work_free(&work);
+		knc_ctx_destroy(ctx);
 		return 0;
 	}
 
-	ret = move_data(&work);
+	if (!attach_local_fds(ctx, STDIN_FILENO, STDOUT_FILENO)) {
+		work_free(&work);
+		knc_ctx_destroy(ctx);
+		return 0;
+	}
 
+	ret = move_data(ctx, &work);
+
+	knc_ctx_destroy(ctx);
 	work_free(&work);
 
 	return ret;
@@ -2047,30 +2474,7 @@ work_init(work_t *work)
 
 	memset(work, 0, sizeof(work_t));
 
-	work->network_fd = -1;
-	work->local_in = -1;
-	work->local_out = -1;
 	work->local_err = -1;
-}
-
-void
-work_close_fd(work_t *work, int fd)
-{
-
-	if (fd < 0)
-		return;
-
-	/* Invalidate every alias before close so each descriptor is closed once. */
-	if (work->network_fd == fd)
-		work->network_fd = -1;
-	if (work->local_in == fd)
-		work->local_in = -1;
-	if (work->local_out == fd)
-		work->local_out = -1;
-	if (work->local_err == fd)
-		work->local_err = -1;
-
-	close(fd);
 }
 
 void
@@ -2083,23 +2487,6 @@ work_free(work_t *work)
 	work->export_name = NULL;
 	free(work->mech);
 	work->mech = NULL;
-
-	if (work->context != NULL) {
-		gstd_close(work->context);
-		work->context = NULL;
-	}
-
-	work_close_fd(work, work->network_fd);
-	work_close_fd(work, work->local_in);
-	work_close_fd(work, work->local_out);
-	work_close_fd(work, work->local_err);
-
-	free(work->service);
-	work->service = NULL;
-	free(work->hostname);
-	work->hostname = NULL;
-	free(work->sprinc);
-	work->sprinc = NULL;
 }
 
 int
