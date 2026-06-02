@@ -185,6 +185,8 @@ struct fd_cookie {
 	int	mine;
 	int	rfd;
 	int	wfd;
+	int	rclosed;
+	int	wclosed;
 };
 
 /* mmm, macros. */
@@ -265,6 +267,7 @@ static void	knc_local_read_eof(knc_ctx);
 static void	knc_local_write_eof(knc_ctx);
 static void	knc_network_read_eof(knc_ctx);
 static void	knc_network_write_eof(knc_ctx);
+static void	knc_maybe_shutdown_fds(knc_ctx);
 
 static stream	knc_find_buf(knc_ctx, int, int);
 
@@ -1792,6 +1795,8 @@ knc_remote_read_eof(knc_ctx ctx)
 
 	if ((ctx->opts & KNC_OPT_NO_HALF_CLOSE) && (ctx->open & OPEN_WRITE))
 		knc_put_eof(ctx, KNC_DIR_SEND);
+
+	knc_maybe_shutdown_fds(ctx);
 }
 
 static void
@@ -1805,6 +1810,8 @@ knc_remote_write_eof(knc_ctx ctx)
 
 	if (ctx->opts & KNC_OPT_NO_HALF_CLOSE)
 		ctx->open &= ~OPEN_READ;
+
+	knc_maybe_shutdown_fds(ctx);
 }
 
 static void
@@ -1818,6 +1825,8 @@ knc_local_read_eof(knc_ctx ctx)
 		knc_put_eof(ctx, KNC_DIR_RECV);
 		ctx->open &= ~OPEN_READ;
 	}
+
+	knc_maybe_shutdown_fds(ctx);
 }
 
 static void
@@ -1831,6 +1840,8 @@ knc_local_write_eof(knc_ctx ctx)
 
 	if ((ctx->opts & KNC_OPT_NO_HALF_CLOSE) && (ctx->open & OPEN_WRITE))
 		knc_put_eof(ctx, KNC_DIR_SEND);
+
+	knc_maybe_shutdown_fds(ctx);
 }
 
 static void
@@ -1841,6 +1852,8 @@ knc_network_read_eof(knc_ctx ctx)
 
 	if ((ctx->opts & KNC_OPT_NO_HALF_CLOSE) && (ctx->open & OPEN_WRITE))
 		knc_put_eof(ctx, KNC_DIR_SEND);
+
+	knc_maybe_shutdown_fds(ctx);
 }
 
 static void
@@ -1851,6 +1864,8 @@ knc_network_write_eof(knc_ctx ctx)
 
 	if (ctx->opts & KNC_OPT_NO_HALF_CLOSE)
 		ctx->open &= ~OPEN_READ;
+
+	knc_maybe_shutdown_fds(ctx);
 }
 
 static int
@@ -2338,36 +2353,19 @@ fdread(void *cookie, void *buf, size_t len)
 static ssize_t
 fdwritev(void *cookie, const struct iovec *iov, int iovcnt)
 {
-	int		fd = ((struct fd_cookie *)cookie)->wfd;
-
-#if defined(O_NOSIGPIPE) || defined(MSG_NOSIGNAL)
-#ifndef MSG_NOSIGNAL
-#define MSG_NOSIGNAL 0
-#endif
-        struct msghdr msg = { 0 };
-
-        msg.msg_name = NULL;
-        msg.msg_namelen = 0;
-        msg.msg_iov = (void *)(uintptr_t)iov;
-        msg.msg_iovlen = iovcnt;
-        msg.msg_control = NULL;
-        msg.msg_controllen = 0;
-        msg.msg_flags = 0;
-        return sendmsg(fd, &msg, MSG_NOSIGNAL);
-#else
 	struct timespec	ts_zero = {0, 0};
 	sigset_t	blocked;
 	sigset_t	pending;
 	sigset_t	sigpipe_mask;
 	ssize_t		ret;
+	int		fd = ((struct fd_cookie *)cookie)->wfd;
 	int		my_errno;
 
 	/*
-	 * On operating systems which do not have O_NOSIGPIPE, we must
-	 * do a bit of a dance to avoid allowing a SIGPIPE to be delivered
-	 * outside our control.  Basically, check to see if there's
-	 * one pending, if not block SIGPIPE, do the writev(2),
-	 * consume any generated SIGPIPE, and restore the old sigmask.
+	 * We must do a bit of a dance to avoid allowing a SIGPIPE to be
+	 * delivered outside our control.  Basically, check to see if there's
+	 * one pending, if not block SIGPIPE, do the writev(2), consume any
+	 * generated SIGPIPE, and restore the old sigmask.
          *
          * pthread_sigmask() is thread-safe, but sigismember() and
          * sigtimedwait() are not.  We might end up consuming a SIGPIPE
@@ -2400,7 +2398,6 @@ fdwritev(void *cookie, const struct iovec *iov, int iovcnt)
 
 	errno = my_errno;
 	return ret;
-#endif
 }
 
 static int
@@ -2416,10 +2413,100 @@ fdclose(void *cookie)
 	if (!mine)
 		return 0;
 
-	if (rfd != wfd)
+	if (wfd != -1 && rfd != wfd)
 		close(wfd);
 
-	return close(rfd);
+	if (rfd != -1)
+		return close(rfd);
+
+	return 0;
+}
+
+static int
+fd_shutdown_or_close(struct fd_cookie *fdc, int how)
+{
+	int	fd;
+	int	ret;
+
+	if (!fdc)
+		return 0;
+
+	switch (how) {
+	case SHUT_RD:
+		if (fdc->rclosed || fdc->rfd == -1)
+			return 0;
+		fd = fdc->rfd;
+		ret = shutdown(fd, SHUT_RD);
+		fdc->rclosed = 1;
+		if (ret == -1) {
+			ret = close(fd);
+			if (fdc->wfd == fd) {
+				fdc->wfd = -1;
+				fdc->wclosed = 1;
+			}
+			fdc->rfd = -1;
+		}
+		return ret;
+	case SHUT_WR:
+		if (fdc->wclosed || fdc->wfd == -1)
+			return 0;
+		fd = fdc->wfd;
+		ret = shutdown(fd, SHUT_WR);
+		fdc->wclosed = 1;
+		if (ret == -1) {
+			ret = close(fd);
+			if (fdc->rfd == fd) {
+				fdc->rfd = -1;
+				fdc->rclosed = 1;
+			}
+			fdc->wfd = -1;
+		}
+		return ret;
+	case SHUT_RDWR:
+		ret = fd_shutdown_or_close(fdc, SHUT_RD);
+		if (fd_shutdown_or_close(fdc, SHUT_WR) == -1)
+			ret = -1;
+		return ret;
+	default:
+		errno = EINVAL;
+		return -1;
+	}
+}
+
+static int
+fd_cookie_readable(struct fd_cookie *fdc)
+{
+
+	return fdc && fdc->rfd != -1 && !fdc->rclosed;
+}
+
+static int
+fd_cookie_writable(struct fd_cookie *fdc)
+{
+
+	return fdc && fdc->wfd != -1 && !fdc->wclosed;
+}
+
+static void
+knc_maybe_shutdown_fds(knc_ctx ctx)
+{
+
+	if (!ctx)
+		return;
+
+	if (!(ctx->open & OPEN_READ) && knc_pending(ctx, KNC_DIR_RECV) == 0) {
+		if (ctx->net_uses_fd)
+			fd_shutdown_or_close(ctx->netcookie, SHUT_RD);
+		if (ctx->local_uses_fd)
+			fd_shutdown_or_close(ctx->localcookie, SHUT_WR);
+	}
+
+	if (!(ctx->open & OPEN_WRITE) && knc_pending(ctx, KNC_DIR_SEND) == 0) {
+		if (ctx->net_uses_fd)
+			fd_shutdown_or_close(ctx->netcookie, SHUT_WR);
+		if (ctx->local_uses_fd)
+			fd_shutdown_or_close(ctx->localcookie, SHUT_RD);
+	}
 }
 
 void
@@ -2438,9 +2525,11 @@ knc_set_net_fds(knc_ctx ctx, int rfd, int wfd)
 		return;
 	}
 
-	cookie->mine = 0;
-	cookie->rfd  = rfd;
-	cookie->wfd  = wfd;
+	cookie->mine    = 0;
+	cookie->rfd     = rfd;
+	cookie->wfd     = wfd;
+	cookie->rclosed = 0;
+	cookie->wclosed = 0;
 
 	ctx->net_uses_fd = 1;
 
@@ -2476,8 +2565,10 @@ int
 knc_get_net_rfd(knc_ctx ctx)
 {
 
-	if (ctx && ctx->net_uses_fd)
-		return ((struct fd_cookie *)ctx->netcookie)->rfd;
+	if (ctx && ctx->net_uses_fd) {
+		if (fd_cookie_readable(ctx->netcookie))
+			return ((struct fd_cookie *)ctx->netcookie)->rfd;
+	}
 
 	return -1;
 }
@@ -2486,8 +2577,10 @@ int
 knc_get_net_wfd(knc_ctx ctx)
 {
 
-	if (ctx && ctx->net_uses_fd)
-		return ((struct fd_cookie *)ctx->netcookie)->wfd;
+	if (ctx && ctx->net_uses_fd) {
+		if (fd_cookie_writable(ctx->netcookie))
+			return ((struct fd_cookie *)ctx->netcookie)->wfd;
+	}
 
 	return -1;
 }
@@ -2508,9 +2601,11 @@ knc_set_local_fds(knc_ctx ctx, int rfd, int wfd)
 		return;
 	}
 
-	cookie->mine = 0;
-	cookie->rfd  = rfd;
-	cookie->wfd  = wfd;
+	cookie->mine    = 0;
+	cookie->rfd     = rfd;
+	cookie->wfd     = wfd;
+	cookie->rclosed = 0;
+	cookie->wclosed = 0;
 
 	ctx->local_uses_fd = 1;
 
@@ -2546,8 +2641,10 @@ int
 knc_get_local_rfd(knc_ctx ctx)
 {
 
-	if (ctx && ctx->local_uses_fd)
-		return ((struct fd_cookie *)ctx->localcookie)->rfd;
+	if (ctx && ctx->local_uses_fd) {
+		if (fd_cookie_readable(ctx->localcookie))
+			return ((struct fd_cookie *)ctx->localcookie)->rfd;
+	}
 
 	return -1;
 }
@@ -2556,8 +2653,10 @@ int
 knc_get_local_wfd(knc_ctx ctx)
 {
 
-	if (ctx && ctx->local_uses_fd)
-		return ((struct fd_cookie *)ctx->localcookie)->wfd;
+	if (ctx && ctx->local_uses_fd) {
+		if (fd_cookie_writable(ctx->localcookie))
+			return ((struct fd_cookie *)ctx->localcookie)->wfd;
+	}
 
 	return -1;
 }
@@ -2630,25 +2729,27 @@ knc_get_pollfds(knc_ctx ctx, struct pollfd *fds, knc_callback *cbs,
 			return (nfds_t)-1;
 	}
 
-	if (knc_get_local_rfd(ctx) != -1 &&
-	    knc_need_input(ctx, KNC_DIR_SEND)) {
-		/*
-		 * Here, we are reading unframed bytes and so we size our
-		 * buffer as the slightly more accurate raw+cooked size for
-		 * comparison.
-		 */
-		cbs[i]		= _fill_send;
-		fds[i].fd	 = knc_get_local_rfd(ctx);
-		fds[i++].events	 = POLLIN;
-		if (i >= nfds)
-			return (nfds_t)-1;
-	}
+	if (knc_is_authenticated(ctx)) {
+		if (knc_get_local_rfd(ctx) != -1 &&
+		    knc_need_input(ctx, KNC_DIR_SEND)) {
+			/*
+			 * Here, we are reading unframed bytes and so we size
+			 * our buffer as the slightly more accurate raw+cooked
+			 * size for comparison.
+			 */
+			cbs[i]		 = _fill_send;
+			fds[i].fd	 = knc_get_local_rfd(ctx);
+			fds[i++].events = POLLIN;
+			if (i >= nfds)
+				return (nfds_t)-1;
+		}
 
-	if (knc_get_local_wfd(ctx) != -1 &&
-	    knc_can_output(ctx, KNC_DIR_RECV)) {
-		cbs[i]		= _flush_recv;
-		fds[i].fd	 = knc_get_local_wfd(ctx);
-		fds[i++].events	 = POLLOUT;
+		if (knc_get_local_wfd(ctx) != -1 &&
+		    knc_can_output(ctx, KNC_DIR_RECV)) {
+			cbs[i]		 = _flush_recv;
+			fds[i].fd	 = knc_get_local_wfd(ctx);
+			fds[i++].events = POLLOUT;
+		}
 	}
 
 	return i;
@@ -2666,7 +2767,7 @@ knc_service_pollfds(knc_ctx ctx, struct pollfd *fds, knc_callback *cbs,
 	for (i=0; i < nfds; i++) {
 		short	revents = fds[i].revents;
 
-		if (revents & (POLLIN|POLLOUT))
+		if (revents & (POLLIN|POLLOUT|POLLERR|POLLHUP|POLLNVAL))
 			cbs[i](ctx);
 
 	}
@@ -2744,7 +2845,8 @@ knc_connect(knc_ctx ctx, const char *hostservice,
 
 	/* XXXrcd: Hell's Bells, the above needs to be fixed. */
 
-	knc_import_set_hb_service(ctx, host, service);
+	if (ctx->service == GSS_C_NO_NAME)
+		knc_import_set_hb_service(ctx, host, service);
 
 	fd = connect_host(ctx, host, port, opts);
 	if (fd == -1)
@@ -2862,6 +2964,7 @@ knc_fill(knc_ctx ctx, int dir)
 	if (dir == KNC_DIR_RECV)
 		knc_state_process_in(ctx);
 
+	knc_maybe_shutdown_fds(ctx);
 	knc_garbage_collect(ctx);
 
 	return 0;
@@ -2933,6 +3036,7 @@ knc_flush(knc_ctx ctx, int dir, size_t flushlen)
 			break;
 	}
 
+	knc_maybe_shutdown_fds(ctx);
 	return 0;
 }
 
@@ -2969,6 +3073,8 @@ knc_shutdown(knc_ctx ctx, int how)
 		errno = EINVAL;
 		return -1;
 	}
+
+	knc_maybe_shutdown_fds(ctx);
 
 	/* XXXrcd: should we flush?  Hmmm, maybe not? */
 	// knc_flush(ctx, KNC_DIR_SEND, -1);

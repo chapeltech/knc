@@ -26,6 +26,15 @@ CLIENT_PRINC = "client@%s" % REALM
 SERVER_PRINC = "host/127.0.0.1@%s" % REALM
 ENCTYPE = "aes256-cts-hmac-sha1-96"
 KNC_TIMEOUT = 20
+OUTPUT_LIMIT = 4096
+
+
+def output_text(data):
+    display = data[:OUTPUT_LIMIT]
+    text = display.decode("utf-8", "replace")
+    if len(data) > OUTPUT_LIMIT:
+        text += "\n[truncated to %d of %d bytes]" % (OUTPUT_LIMIT, len(data))
+    return text
 
 
 HELPER = r'''
@@ -128,6 +137,17 @@ elif scenario == "request_response":
     rest = read_all()
     write_json(side, {"rest": base64.b64encode(rest).decode("ascii")})
 
+elif scenario == "large_request_response":
+    first = read_exact(8192)
+    response = payload(512 * 1024 + 29)
+    write_all(response)
+    rest = read_all(delay=True)
+    data = first + rest
+    write_json(side, {
+        "input": digest(data),
+        "response": digest(response),
+    })
+
 elif scenario == "client_half_close":
     data = read_all()
     status = "not-written"
@@ -190,9 +210,15 @@ class MissingTool(RuntimeError):
 
 
 class KNCExecTests(unittest.TestCase):
+    knc_path = os.path.join("bin", "knc")
+    client_knc_path = None
+    server_knc_path = None
+
     @classmethod
     def setUpClass(cls):
         cls.knc = os.path.abspath(cls.knc_path)
+        cls.client_knc = os.path.abspath(cls.client_knc_path or cls.knc_path)
+        cls.server_knc = os.path.abspath(cls.server_knc_path or cls.knc_path)
         cls.tmp = tempfile.TemporaryDirectory(prefix="knc-exec-tests.")
         cls.tmpdir = cls.tmp.name
         cls.helper = os.path.join(cls.tmpdir, "knc_exec_helper.py")
@@ -200,8 +226,12 @@ class KNCExecTests(unittest.TestCase):
         cls.ccache = os.path.join(cls.tmpdir, "client.ccache")
         cls.krb5_conf = os.path.join(cls.tmpdir, "krb5.conf")
 
-        if not os.path.exists(cls.knc):
-            raise RuntimeError("knc executable not found: %s" % cls.knc)
+        if not os.path.exists(cls.client_knc):
+            raise RuntimeError(
+                "client knc executable not found: %s" % cls.client_knc)
+        if not os.path.exists(cls.server_knc):
+            raise RuntimeError(
+                "server knc executable not found: %s" % cls.server_knc)
 
         cls.ktutil = shutil.which("ktutil")
         cls.kimpersonate = shutil.which("kimpersonate")
@@ -312,7 +342,7 @@ class KNCExecTests(unittest.TestCase):
         listener.close()
 
         argv = [
-            self.knc,
+            self.server_knc,
             "-l",
         ]
         if no_fork:
@@ -339,8 +369,7 @@ class KNCExecTests(unittest.TestCase):
             stdout, stderr = proc.communicate()
             self.fail(
                 "server failed to start\nstdout:\n%s\nstderr:\n%s" %
-                (stdout.decode("utf-8", "replace"),
-                 stderr.decode("utf-8", "replace"))
+                (output_text(stdout), output_text(stderr))
             )
         return proc, port
 
@@ -352,7 +381,7 @@ class KNCExecTests(unittest.TestCase):
         listener.close()
 
         argv = [
-            self.knc,
+            self.server_knc,
             "-l",
             "-f",
             "-M", "1",
@@ -373,14 +402,48 @@ class KNCExecTests(unittest.TestCase):
             stdout, stderr = proc.communicate()
             self.fail(
                 "server failed to start\nstdout:\n%s\nstderr:\n%s" %
-                (stdout.decode("utf-8", "replace"),
-                 stderr.decode("utf-8", "replace"))
+                (output_text(stdout), output_text(stderr))
+            )
+        return proc, port
+
+    def start_server_with_listener_fd_zero(self, scenario, side):
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(5)
+        port = listener.getsockname()[1]
+
+        argv = [
+            self.server_knc,
+            "-l",
+            "-f",
+            "-M", "1",
+            "-N", "0",
+            sys.executable,
+            self.helper,
+            scenario,
+            side,
+        ]
+        proc = subprocess.Popen(
+            argv,
+            env=self.server_env(),
+            stdin=listener,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        listener.close()
+        time.sleep(0.1)
+        if proc.poll() is not None:
+            stdout, stderr = proc.communicate()
+            self.fail(
+                "server failed to start\nstdout:\n%s\nstderr:\n%s" %
+                (output_text(stdout), output_text(stderr))
             )
         return proc, port
 
     def client_argv(self, port, client_opts=(), hostservice="host@127.0.0.1"):
         return [
-            self.knc,
+            self.client_knc,
         ] + list(client_opts) + [
             hostservice,
             str(port),
@@ -389,7 +452,7 @@ class KNCExecTests(unittest.TestCase):
     def client_argv_with_network_fd(self, fd, client_opts=(),
                                     hostservice="host@127.0.0.1"):
         return [
-            self.knc,
+            self.client_knc,
         ] + list(client_opts) + [
             "-N", str(fd),
             hostservice,
@@ -402,15 +465,13 @@ class KNCExecTests(unittest.TestCase):
             server.kill()
             stdout, stderr = server.communicate()
             self.fail("server timed out\nstdout:\n%s\nstderr:\n%s" %
-                      (stdout.decode("utf-8", "replace"),
-                       stderr.decode("utf-8", "replace")))
+                      (output_text(stdout), output_text(stderr)))
         # The current listener path exits with 1 after a successful -M 1 run
         # because do_listener() returns 0 and main negates that value.
         self.assertIn(
             server.returncode, (0, 1),
             "server failed\nstdout:\n%s\nstderr:\n%s" %
-            (stdout.decode("utf-8", "replace"),
-             stderr.decode("utf-8", "replace"))
+            (output_text(stdout), output_text(stderr))
         )
         return stdout, stderr
 
@@ -431,8 +492,7 @@ class KNCExecTests(unittest.TestCase):
             client.kill()
             cout, cerr = client.communicate()
             self.fail("client timed out\nstdout:\n%s\nstderr:\n%s" %
-                      (cout.decode("utf-8", "replace"),
-                       cerr.decode("utf-8", "replace")))
+                      (output_text(cout), output_text(cerr)))
         return client.returncode, cout, cerr
 
     def run_client_with_wrapped_network_fd(self, port, input_data=b"",
@@ -456,8 +516,7 @@ class KNCExecTests(unittest.TestCase):
             client.kill()
             cout, cerr = client.communicate()
             self.fail("client timed out\nstdout:\n%s\nstderr:\n%s" %
-                      (cout.decode("utf-8", "replace"),
-                       cerr.decode("utf-8", "replace")))
+                      (output_text(cout), output_text(cerr)))
         return client.returncode, cout, cerr
 
     def run_session(self, scenario, input_data=b"", server_opts=(),
@@ -470,8 +529,7 @@ class KNCExecTests(unittest.TestCase):
             self.assertEqual(
                 returncode, 0,
                 "client failed\nstdout:\n%s\nstderr:\n%s" %
-                (cout.decode("utf-8", "replace"),
-                 cerr.decode("utf-8", "replace"))
+                (output_text(cout), output_text(cerr))
             )
             sout, serr = self.finish_server(server)
             return side, cout, cerr, sout, serr
@@ -520,8 +578,7 @@ class KNCExecTests(unittest.TestCase):
             self.assertEqual(
                 client.returncode, 0,
                 "client failed\nstdout:\n%s\nstderr:\n%s" %
-                ((first + rest).decode("utf-8", "replace"),
-                 cerr.decode("utf-8", "replace"))
+                (output_text(first + rest), output_text(cerr))
             )
             self.finish_server(server)
             return side, first + rest
@@ -580,8 +637,7 @@ class KNCExecTests(unittest.TestCase):
             self.assertEqual(
                 client.returncode, 0,
                 "client failed\nstdout:\n%s\nstderr:\n%s" %
-                (rest.decode("utf-8", "replace"),
-                 cerr.decode("utf-8", "replace"))
+                (output_text(rest), output_text(cerr))
             )
             self.finish_server(server)
             self.wait_for_json_event(side, "read_done")
@@ -632,6 +688,17 @@ class KNCExecTests(unittest.TestCase):
         self.assertEqual(out, b"one:alphatwo:beta")
         self.assertEqual(self.read_json(side), {"rest": ""})
 
+    def test_exec_large_request_response_does_not_deadlock(self):
+        data = deterministic_payload(1024 * 1024 + 8193)
+        expected = deterministic_payload(512 * 1024 + 29)
+        side, out, _, _, _ = self.run_session("large_request_response", data)
+        self.assertEqual(out, expected)
+        result = self.read_json(side)
+        self.assertEqual(result["input"]["len"], len(data))
+        self.assertEqual(result["input"]["sha256"], sha256(data))
+        self.assertEqual(result["response"]["len"], len(expected))
+        self.assertEqual(result["response"]["sha256"], sha256(expected))
+
     def test_client_wraps_existing_network_fd_with_N(self):
         side = self.side_path("wrapped_network_fd.jsonl")
         server, port = self.start_server("connection_marker", side)
@@ -642,8 +709,36 @@ class KNCExecTests(unittest.TestCase):
             self.assertEqual(
                 returncode, 0,
                 "client failed\nstdout:\n%s\nstderr:\n%s" %
-                (out.decode("utf-8", "replace"),
-                 err.decode("utf-8", "replace"))
+                (output_text(out), output_text(err))
+            )
+            self.assertEqual(out, b"conn:" + payload)
+            self.finish_server(server)
+            records = self.read_json_lines(side)
+            self.assertEqual(len(records), 1)
+            self.assertEqual(
+                base64.b64decode(records[0]["data"].encode("ascii")),
+                payload,
+            )
+        finally:
+            if server.poll() is None:
+                server.terminate()
+                try:
+                    server.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    server.kill()
+                    server.wait()
+
+    def test_listener_wraps_listener_fd_zero_with_N(self):
+        side = self.side_path("listener_fd_zero.jsonl")
+        server, port = self.start_server_with_listener_fd_zero(
+            "connection_marker", side)
+        try:
+            payload = b"listener fd zero"
+            returncode, out, err = self.run_client(port, payload)
+            self.assertEqual(
+                returncode, 0,
+                "client failed\nstdout:\n%s\nstderr:\n%s" %
+                (output_text(out), output_text(err))
             )
             self.assertEqual(out, b"conn:" + payload)
             self.finish_server(server)
@@ -674,8 +769,7 @@ class KNCExecTests(unittest.TestCase):
             self.assertEqual(
                 returncode, 0,
                 "client failed\nstdout:\n%s\nstderr:\n%s" %
-                (out.decode("utf-8", "replace"),
-                 err.decode("utf-8", "replace"))
+                (output_text(out), output_text(err))
             )
             self.assertEqual(out, b"conn:" + payload)
             self.finish_server(server)
@@ -685,6 +779,31 @@ class KNCExecTests(unittest.TestCase):
                 base64.b64decode(records[0]["data"].encode("ascii")),
                 payload,
             )
+        finally:
+            if server.poll() is None:
+                server.terminate()
+                try:
+                    server.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    server.kill()
+                    server.wait()
+
+    def test_client_empty_stdin_relays_eof(self):
+        side = self.side_path("empty_stdin.jsonl")
+        server, port = self.start_server("connection_marker", side)
+        try:
+            returncode, out, err = self.run_client(port, b"")
+            self.assertEqual(
+                returncode, 0,
+                "client failed\nstdout:\n%s\nstderr:\n%s" %
+                (output_text(out), output_text(err))
+            )
+            self.assertEqual(out, b"conn:")
+            self.finish_server(server)
+            records = self.read_json_lines(side)
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]["len"], 0)
+            self.assertEqual(records[0]["sha256"], sha256(b""))
         finally:
             if server.poll() is None:
                 server.terminate()
@@ -706,8 +825,7 @@ class KNCExecTests(unittest.TestCase):
             self.assertEqual(
                 returncode, 0,
                 "client failed\nstdout:\n%s\nstderr:\n%s" %
-                (out.decode("utf-8", "replace"),
-                 err.decode("utf-8", "replace"))
+                (output_text(out), output_text(err))
             )
             self.assertEqual(out, b"conn:" + payload)
             self.finish_server(server)
@@ -735,8 +853,7 @@ class KNCExecTests(unittest.TestCase):
             self.assertEqual(
                 returncode, 0,
                 "client failed\nstdout:\n%s\nstderr:\n%s" %
-                (out.decode("utf-8", "replace"),
-                 err.decode("utf-8", "replace"))
+                (output_text(out), output_text(err))
             )
             self.assertEqual(out, b"conn:" + payload)
             self.finish_server(server)
@@ -810,8 +927,7 @@ class KNCExecTests(unittest.TestCase):
             self.assertNotEqual(
                 returncode, 0,
                 "client unexpectedly succeeded\nstdout:\n%s\nstderr:\n%s" %
-                (out.decode("utf-8", "replace"),
-                 err.decode("utf-8", "replace"))
+                (output_text(out), output_text(err))
             )
             self.finish_server(server)
             self.assertFalse(os.path.exists(side))
@@ -861,8 +977,7 @@ class KNCExecTests(unittest.TestCase):
             self.assertEqual(
                 returncode, 0,
                 "client failed\nstdout:\n%s\nstderr:\n%s" %
-                (out.decode("utf-8", "replace"),
-                 err.decode("utf-8", "replace"))
+                (output_text(out), output_text(err))
             )
             self.finish_server(server)
             thread.join(KNC_TIMEOUT)
@@ -952,8 +1067,7 @@ class KNCExecTests(unittest.TestCase):
             self.assertEqual(
                 client.returncode, 0,
                 "client failed\nstdout:\n%s\nstderr:\n%s" %
-                (rest.decode("utf-8", "replace"),
-                 err.decode("utf-8", "replace"))
+                (output_text(rest), output_text(err))
             )
             self.finish_server(server)
             thread.join(KNC_TIMEOUT)
@@ -1021,8 +1135,7 @@ class KNCExecTests(unittest.TestCase):
             self.assertEqual(
                 returncode, 0,
                 "client failed\nstdout:\n%s\nstderr:\n%s" %
-                (out.decode("utf-8", "replace"),
-                 err.decode("utf-8", "replace"))
+                (output_text(out), output_text(err))
             )
             self.assertEqual(out, b"")
             self.finish_server(server)
@@ -1055,14 +1168,12 @@ class KNCExecTests(unittest.TestCase):
             self.assertEqual(
                 rc1, 0,
                 "first client failed\nstdout:\n%s\nstderr:\n%s" %
-                (out1.decode("utf-8", "replace"),
-                 err1.decode("utf-8", "replace"))
+                (output_text(out1), output_text(err1))
             )
             self.assertEqual(
                 rc2, 0,
                 "second client failed\nstdout:\n%s\nstderr:\n%s" %
-                (out2.decode("utf-8", "replace"),
-                 err2.decode("utf-8", "replace"))
+                (output_text(out2), output_text(err2))
             )
             self.assertEqual(out1, b"conn:first")
             self.assertEqual(out2, b"conn:second")
@@ -1085,10 +1196,16 @@ class KNCExecTests(unittest.TestCase):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--knc", default=os.path.join("bin", "knc"),
-                        help="path to the knc executable")
+                        help="path to use for both knc client and server")
+    parser.add_argument("--client-knc",
+                        help="path to the knc executable to run as client")
+    parser.add_argument("--server-knc",
+                        help="path to the knc executable to run as server")
     args, unittest_args = parser.parse_known_args()
 
     KNCExecTests.knc_path = args.knc
+    KNCExecTests.client_knc_path = args.client_knc
+    KNCExecTests.server_knc_path = args.server_knc
     missing = [tool for tool in ("ktutil", "kimpersonate")
                if shutil.which(tool) is None]
     if missing:
