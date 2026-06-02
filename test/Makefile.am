@@ -22,4 +22,5 @@ check-knc-exec:
 
 .PHONY: bench-knc
 bench-knc:
-	python3 $(srcdir)/knc-bench.py --old-knc /usr/local/bin/knc --new-knc $(top_builddir)/bin/knc $(KNC_BENCH_ARGS)
+	LD_LIBRARY_PATH=$(top_builddir)/lib/.libs$${LD_LIBRARY_PATH:+:$${LD_LIBRARY_PATH}} \
+	    python3 $(srcdir)/knc-bench.py --old-knc /usr/local/bin/knc --new-knc $(top_builddir)/bin/.libs/knc $(KNC_BENCH_ARGS)
