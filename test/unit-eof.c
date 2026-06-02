@@ -63,6 +63,8 @@ test_no_half_close_option(void)
 	check(ctx != NULL, "knc_ctx_init failed");
 	check(!knc_get_opt(ctx, KNC_OPT_NO_HALF_CLOSE),
 	    "KNC_OPT_NO_HALF_CLOSE defaulted to enabled");
+	check(!knc_get_opt(ctx, KNC_OPT_SENDCMDS),
+	    "KNC_OPT_SENDCMDS defaulted to enabled");
 
 	knc_set_opt(ctx, KNC_OPT_NO_HALF_CLOSE, 1);
 	check(knc_get_opt(ctx, KNC_OPT_NO_HALF_CLOSE),
@@ -72,11 +74,19 @@ test_no_half_close_option(void)
 	check(!knc_get_opt(ctx, KNC_OPT_NO_HALF_CLOSE),
 	    "KNC_OPT_NO_HALF_CLOSE did not disable");
 
+	knc_set_opt(ctx, KNC_OPT_SENDCMDS, 1);
+	check(knc_get_opt(ctx, KNC_OPT_SENDCMDS),
+	    "KNC_OPT_SENDCMDS did not enable");
+
+	knc_set_opt(ctx, KNC_OPT_SENDCMDS, 0);
+	check(!knc_get_opt(ctx, KNC_OPT_SENDCMDS),
+	    "KNC_OPT_SENDCMDS did not disable");
+
 	knc_ctx_destroy(ctx);
 }
 
 static void
-test_local_read_eof_queues_send_eof(void)
+test_local_read_eof_does_not_queue_command_by_default(void)
 {
 	knc_ctx	ctx;
 	int	fds[2];
@@ -94,15 +104,43 @@ test_local_read_eof_queues_send_eof(void)
 	check_no_error(ctx, "local read EOF set an error");
 	check(!(ctx->open & OPEN_WRITE), "local read EOF left write side open");
 	check(ctx->open & OPEN_READ, "local read EOF closed read side");
-	check(knc_pending(ctx, KNC_DIR_SEND) == 1,
-	    "local read EOF did not queue exactly one EOF command");
+	check(knc_pending(ctx, KNC_DIR_SEND) == 0,
+	    "local read EOF queued a command by default");
 
 	close(fds[0]);
 	knc_ctx_destroy(ctx);
 }
 
 static void
-test_no_half_close_local_read_eof_closes_both_sides(void)
+test_local_read_eof_queues_send_eof_with_commands(void)
+{
+	knc_ctx	ctx;
+	int	fds[2];
+	int	ret;
+
+	check(pipe(fds) == 0, "pipe failed");
+	close(fds[1]);
+
+	ctx = knc_ctx_init();
+	check(ctx != NULL, "knc_ctx_init failed");
+	knc_set_opt(ctx, KNC_OPT_SENDCMDS, 1);
+	knc_set_local_fds(ctx, fds[0], -1);
+
+	ret = knc_fill(ctx, KNC_DIR_SEND);
+	check(ret == 0, "command local read EOF returned an error");
+	check_no_error(ctx, "command local read EOF set an error");
+	check(!(ctx->open & OPEN_WRITE),
+	    "command local read EOF left write side open");
+	check(ctx->open & OPEN_READ, "command local read EOF closed read side");
+	check(knc_pending(ctx, KNC_DIR_SEND) == 1,
+	    "command local read EOF did not queue exactly one EOF command");
+
+	close(fds[0]);
+	knc_ctx_destroy(ctx);
+}
+
+static void
+test_no_half_close_local_read_eof_closes_both_sides_by_default(void)
 {
 	knc_ctx	ctx;
 	int	fds[2];
@@ -120,8 +158,35 @@ test_no_half_close_local_read_eof_closes_both_sides(void)
 	check(ret == 0, "no-half-close local read EOF returned an error");
 	check_no_error(ctx, "no-half-close local read EOF set an error");
 	check(ctx->open == 0, "no-half-close local read EOF left a side open");
+	check(knc_pending(ctx, KNC_DIR_SEND) == 0,
+	    "no-half-close local read EOF queued commands by default");
+
+	close(fds[0]);
+	knc_ctx_destroy(ctx);
+}
+
+static void
+test_no_half_close_local_read_eof_queues_commands_when_enabled(void)
+{
+	knc_ctx	ctx;
+	int	fds[2];
+	int	ret;
+
+	check(pipe(fds) == 0, "pipe failed");
+	close(fds[1]);
+
+	ctx = knc_ctx_init();
+	check(ctx != NULL, "knc_ctx_init failed");
+	knc_set_opt(ctx, KNC_OPT_SENDCMDS, 1);
+	knc_set_opt(ctx, KNC_OPT_NO_HALF_CLOSE, 1);
+	knc_set_local_fds(ctx, fds[0], -1);
+
+	ret = knc_fill(ctx, KNC_DIR_SEND);
+	check(ret == 0, "command no-half-close EOF returned an error");
+	check_no_error(ctx, "command no-half-close EOF set an error");
+	check(ctx->open == 0, "command no-half-close EOF left a side open");
 	check(knc_pending(ctx, KNC_DIR_SEND) == 2,
-	    "no-half-close local read EOF did not queue both EOF commands");
+	    "command no-half-close EOF did not queue both EOF commands");
 
 	close(fds[0]);
 	knc_ctx_destroy(ctx);
@@ -212,8 +277,42 @@ test_local_write_epipe_queues_receive_eof(void)
 	    "local write EPIPE closed write side");
 	check(knc_pending(ctx, KNC_DIR_RECV) == 0,
 	    "local write EPIPE left receive data pending");
+	check(knc_pending(ctx, KNC_DIR_SEND) == 0,
+	    "local write EPIPE queued a command by default");
+
+	close(fds[0]);
+	knc_ctx_destroy(ctx);
+}
+
+static void
+test_local_write_epipe_queues_receive_eof_with_commands(void)
+{
+	knc_ctx	ctx;
+	int	fds[2];
+	int	ret;
+
+	check(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0,
+	    "socketpair failed");
+	close(fds[1]);
+
+	ctx = knc_ctx_init();
+	check(ctx != NULL, "knc_ctx_init failed");
+	ctx->state = STATE_SESSION;
+	knc_set_opt(ctx, KNC_OPT_SENDCMDS, 1);
+	knc_set_local_fds(ctx, -1, fds[0]);
+	put_stream(&ctx->cooked_recv, "x", 1);
+
+	ret = knc_flush(ctx, KNC_DIR_RECV, 0);
+	check(ret == 0, "command local write EPIPE returned an error");
+	check_no_error(ctx, "command local write EPIPE set an error");
+	check(!(ctx->open & OPEN_READ),
+	    "command local write EPIPE left read side open");
+	check(ctx->open & OPEN_WRITE,
+	    "command local write EPIPE closed write side");
+	check(knc_pending(ctx, KNC_DIR_RECV) == 0,
+	    "command local write EPIPE left receive data pending");
 	check(knc_pending(ctx, KNC_DIR_SEND) == 1,
-	    "local write EPIPE did not queue receive EOF command");
+	    "command local write EPIPE did not queue receive EOF command");
 
 	close(fds[0]);
 	knc_ctx_destroy(ctx);
@@ -389,11 +488,14 @@ main(void)
 {
 
 	test_no_half_close_option();
-	test_local_read_eof_queues_send_eof();
-	test_no_half_close_local_read_eof_closes_both_sides();
+	test_local_read_eof_does_not_queue_command_by_default();
+	test_local_read_eof_queues_send_eof_with_commands();
+	test_no_half_close_local_read_eof_closes_both_sides_by_default();
+	test_no_half_close_local_read_eof_queues_commands_when_enabled();
 	test_network_eof_after_authentication_is_eof();
 	test_network_mid_packet_eof_is_protocol_error();
 	test_local_write_epipe_queues_receive_eof();
+	test_local_write_epipe_queues_receive_eof_with_commands();
 	test_network_write_epipe_closes_write_side();
 	test_remote_read_eof_closes_local_write_after_receive_drain();
 	test_local_flush_writes_to_pipe();

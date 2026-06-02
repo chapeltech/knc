@@ -220,6 +220,7 @@ test_large_command_uses_exact_storage(void)
 	memset(data, 0x5a, datalen);
 	ctx = knc_ctx_init();
 	check(ctx != NULL, "knc_ctx_init failed");
+	knc_set_opt(ctx, KNC_OPT_SENDCMDS, 1);
 
 	expected = sizeof(uint32_t) + sizeof(command) + sizeof(uint32_t) +
 	    datalen;
