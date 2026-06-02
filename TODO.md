@@ -17,7 +17,7 @@ Before changing transport code, extend `test/knc-exec-tests.py` so the current
   - [x] client EOF followed by daemon response
   - [x] daemon EOF followed by client EOF
   - [x] `-o no-half-close`
-- [ ] Add old/new binary matrix support once a libknc-backed test binary exists:
+- [x] Add old/new binary matrix support once a libknc-backed test binary exists:
   - legacy client to legacy server
   - legacy client to libknc server
   - libknc client to legacy server
@@ -32,14 +32,14 @@ Acceptance criteria:
 
 ## 2. Add A Temporary libknc-backed Binary
 
-Add a temporary development binary, probably `knc-libknc`, that shares the
-existing command-line, listener, process-launch, and Unix socket setup code, but
-uses libknc for the authenticated transport path.
+This was the staging step that let the libknc transport path share the existing
+command-line, listener, process-launch, and Unix socket setup code before the
+installed `knc` binary was switched over.
 
-- [ ] Keep installed `knc` on the current implementation during development.
-- [ ] Add a build target for `knc-libknc`.
-- [ ] Add test-suite options to select client and server binaries independently.
-- [ ] Use the temporary binary to run old/new interop combinations.
+- [x] Keep installed `knc` on the current implementation during development.
+- [x] Add a temporary libknc-backed build target.
+- [x] Add test-suite options to select client and server binaries independently.
+- [x] Use the temporary binary to run old/new interop combinations.
 
 Acceptance criteria:
 
@@ -75,29 +75,37 @@ Acceptance criteria:
 
 Replace the executable's transport core with a libknc context.
 
-- [ ] Create a `knc_ctx` per connection.
-- [ ] Apply executable options:
+- [x] Reshape setup code so the libknc context exists earlier:
+  - call `knc_ctx_init()` before Unix socket / exec / stdio local-fd setup
+  - pass `knc_ctx` into helpers such as `do_unix_socket()`
+  - have those helpers give or set their fds directly on the `knc_ctx`
+  - keep `work_t` for connection metadata and credential propagation, not as
+    the primary owner of transport fds
+  - avoid managing the same fd lifetime in both `knc.c` and libknc
+- [x] Create a `knc_ctx` per connection.
+- [x] Apply executable options:
   - `KNC_OPT_NOPRIVACY`
   - new no-half-close option
   - requested mechanism from `-m`
   - debug level/prefix if useful
-- [ ] Attach the network fd with `knc_give_net_fd()`.
-- [ ] Server path: call `knc_accept()`.
-- [ ] Client path: import service name or explicit `-P` principal, then call
+- [x] Attach the network fd with `knc_give_net_fd()`.
+- [x] Server path: call `knc_accept()`.
+- [x] Client path: import service name or explicit `-P` principal, then call
   `knc_initiate()`.
-- [ ] Authenticate.
-- [ ] Populate environment variables or Unix socket prelude from libknc
+- [x] Authenticate.
+- [x] Populate environment variables or Unix socket prelude from libknc
   metadata.
-- [ ] Attach local fds:
+- [x] Attach local fds:
   - exec mode: child stdout as local read fd, child stdin as local write fd
   - no-program stdio mode: stdin/stdout, preserving tested direction
   - Unix socket mode: the connected Unix socket fd
-- [ ] Run the libknc poll loop until I/O is complete or an error occurs.
-- [ ] Close and destroy the context.
+- [x] Run the libknc poll loop until I/O is complete or an error occurs.
+- [x] Close and destroy the context.
 
 Acceptance criteria:
 
-- `knc-libknc` passes the executable suite in client and server roles.
+- The libknc-backed executable passes the executable suite in client and
+  server roles.
 - The code no longer hand-rolls GSS wrapping/unwrapping in `bin/knc.c`.
 
 ## 5. Run Interop Matrix
@@ -127,16 +135,16 @@ Acceptance criteria:
 
 ## 6. Flip Installed knc
 
-Once `knc-libknc` passes the suite and interop matrix, make the installed
+Once the libknc-backed path passes the executable suite, make the installed
 `knc` binary use libknc.
 
-- [ ] Replace the current `do_work()` transport path with the libknc-backed
+- [x] Replace the current `do_work()` transport path with the libknc-backed
   implementation.
-- [ ] Remove `bin/gssstdio.c` and `bin/gssstdio.h` from the executable build.
+- [x] Remove `bin/gssstdio.c` and `bin/gssstdio.h` from the executable build.
 - [ ] Remove now-unused hand-rolled GSS buffer code from `bin/knc.c`.
 - [ ] Keep only CLI, listener, process, Unix socket, and credential propagation
   code in the executable.
-- [ ] Update build files.
+- [x] Update build files.
 - [ ] Update documentation if behaviour or dependencies are user-visible.
 
 Acceptance criteria:
@@ -146,11 +154,22 @@ Acceptance criteria:
 - `make check-knc-exec` passes.
 - The installed `knc` executable is backed by libknc.
 
+## 7. Remaining gssstdio Gap Analysis
+
+- [ ] Decide whether stalled server-side GSS authentication should preserve the
+  old `gstd_accept()` 60s packet read timeout.  The libknc-backed executable
+  currently calls `knc_authenticate()`, whose helper loop can wait
+  indefinitely unless libknc reports an error.
+- [ ] Change `AC_CONFIG_SRCDIR` away from `bin/gssstdio.c` before deleting the
+  old source file.
+- [ ] Remove the compiled-out legacy GSS transport code from `bin/knc.c` after
+  the libknc-backed path has settled.
+
 ## Likely Commit Sequence
 
 - [ ] Add missing compatibility tests.
 - [ ] Fix libknc fd `0`, EOF, EPIPE, and metadata behaviour.
-- [ ] Add temporary `knc-libknc` plus binary matrix support.
-- [ ] Make `knc-libknc` pass executable tests.
-- [ ] Flip installed `knc` to libknc.
+- [x] Add temporary libknc-backed binary plus binary matrix support.
+- [x] Make the libknc-backed executable pass executable tests.
+- [x] Flip installed `knc` to libknc.
 - [ ] Remove legacy executable GSS transport code.
