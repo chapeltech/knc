@@ -2520,7 +2520,8 @@ knc_get_pollfds(knc_ctx ctx, struct pollfd *fds, knc_callback *cbs,
 	if (!ctx)
 		return 0;
 
-	if (knc_get_net_rfd(ctx) && knc_need_input(ctx, KNC_DIR_RECV)) {
+	if (knc_get_net_rfd(ctx) != -1 &&
+	    knc_need_input(ctx, KNC_DIR_RECV)) {
 		cbs[i]		= _fill_recv;
 		fds[i].fd	= knc_get_net_rfd(ctx);
 		fds[i++].events	= POLLIN;
