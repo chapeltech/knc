@@ -1146,6 +1146,7 @@ knc_get_opt(knc_ctx ctx, unsigned opt)
 	switch (opt) {
 	case KNC_OPT_NOPRIVACY:
 	case KNC_OPT_NO_HALF_CLOSE:
+	case KNC_OPT_SENDCMDS:
 	case KNC_SOCK_NONBLOCK:
 	case KNC_SOCK_CLOEXEC:
 		return (ctx->opts & opt) ? 1 : 0;
@@ -1550,9 +1551,11 @@ knc_state_session(knc_ctx ctx, void *buf, size_t len)
 	}
 
 	if (out.length == 0) {
-		/* XXXrcd: do we need this release? */
 		gss_release_buffer(&min, &out);
-		ctx->state = STATE_COMMAND;
+		if (ctx->opts & KNC_OPT_SENDCMDS)
+			ctx->state = STATE_COMMAND;
+		else
+			knc_remote_read_eof(ctx);
 		return 0;
 	}
 
@@ -2115,6 +2118,9 @@ knc_put_eof(knc_ctx ctx, int dir)
 		buf[0] = 1;
 	}
 
+	if (!(ctx->opts & KNC_OPT_SENDCMDS))
+		return 0;
+
 	put_stream_command(&ctx->raw_send, buf, 1);
 	return 0;
 }
@@ -2129,6 +2135,10 @@ knc_put_command(knc_ctx ctx, const char *cmd, uint32_t cmdseqno,
 	size_t	 tlen = 0;
 
 	len = sizeof(cmdseqno) + strlen(cmd) + 1 + sizeof(datalen) + datalen;
+
+	if (!(ctx->opts & KNC_OPT_SENDCMDS))
+		return 0;
+
 	tmp = buf = malloc(len);
 	if (!buf)
 		return 0;

@@ -101,8 +101,10 @@ test_pollhup_services_local_read(void)
 	check(found, "local read fd was not returned by knc_get_pollfds");
 	knc_service_pollfds(ctx, fds, cbs, nfds);
 	check(!knc_error(ctx), "POLLHUP service set an error");
-	check(knc_pending(ctx, KNC_DIR_SEND) == 1,
-	    "POLLHUP did not queue local read EOF");
+	check(!(ctx->open & OPEN_WRITE),
+	    "POLLHUP service left write side open");
+	check(knc_pending(ctx, KNC_DIR_SEND) == 0,
+	    "POLLHUP queued a command by default");
 
 	close(pipefds[0]);
 	knc_ctx_destroy(ctx);
@@ -141,8 +143,10 @@ test_pollerr_services_local_read(void)
 	check(found, "local read fd was not returned by knc_get_pollfds");
 	knc_service_pollfds(ctx, fds, cbs, nfds);
 	check(!knc_error(ctx), "POLLERR service set an error");
-	check(knc_pending(ctx, KNC_DIR_SEND) == 1,
-	    "POLLERR did not queue local read EOF");
+	check(!(ctx->open & OPEN_WRITE),
+	    "POLLERR service left write side open");
+	check(knc_pending(ctx, KNC_DIR_SEND) == 0,
+	    "POLLERR queued a command by default");
 
 	close(pipefds[0]);
 	knc_ctx_destroy(ctx);
