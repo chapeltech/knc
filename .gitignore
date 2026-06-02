@@ -38,7 +38,12 @@ Makefile.in
 /ltmain.sh
 /missing
 /stamp-h1
+/test-driver
 /test/servefile
+/test/test-suite.log
 /test/testknc
 /test/unit
 /test/unit-simple
+/test/unit-pollfds
+/test/unit-pollfds.log
+/test/unit-pollfds.trs
