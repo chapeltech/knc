@@ -21,8 +21,9 @@ REALM = "KNC.TEST"
 CLIENT_PRINC = "client@%s" % REALM
 SERVER_PRINC = "host/127.0.0.1@%s" % REALM
 ENCTYPE = "aes256-cts-hmac-sha1-96"
-TIMEOUT = 60
+TIMEOUT = 180
 MIB = 1024 * 1024
+_DIGEST_CACHE = {}
 
 
 HELPER = r'''
@@ -107,12 +108,34 @@ else:
 '''
 
 
+def deterministic_chunks(size, chunk_size=MIB):
+    offset = 0
+    while offset < size:
+        length = min(chunk_size, size - offset)
+        yield bytes(
+            (((i + offset) * 31 + 7) & 0xff) for i in range(length)
+        )
+        offset += length
+
+
 def deterministic_payload(size):
-    return bytes(((i * 31 + 7) & 0xff) for i in range(size))
+    return b"".join(deterministic_chunks(size))
 
 
 def digest(data):
     return {"len": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+
+
+def deterministic_digest(size):
+    if size in _DIGEST_CACHE:
+        return dict(_DIGEST_CACHE[size])
+
+    h = hashlib.sha256()
+    for chunk in deterministic_chunks(size):
+        h.update(chunk)
+    ret = {"len": size, "sha256": h.hexdigest()}
+    _DIGEST_CACHE[size] = ret
+    return dict(ret)
 
 
 def median(values):
@@ -131,17 +154,27 @@ class Case:
         self.input_size = input_size
         self.output_size = output_size
         self.helper_args = tuple(helper_args)
-        self.input_data = deterministic_payload(input_size)
-        self.expected_input = digest(self.input_data)
-        self.expected_output = (
-            digest(deterministic_payload(output_size))
-            if output_size
-            else digest(b"")
-        )
+        self._expected_input = None
+        self._expected_output = None
 
     @property
     def total_bytes(self):
         return self.input_size + self.output_size
+
+    @property
+    def expected_input(self):
+        if self._expected_input is None:
+            self._expected_input = deterministic_digest(self.input_size)
+        return self._expected_input
+
+    @property
+    def expected_output(self):
+        if self._expected_output is None:
+            self._expected_output = deterministic_digest(self.output_size)
+        return self._expected_output
+
+    def input_data(self):
+        return deterministic_payload(self.input_size)
 
 
 class Binary:
@@ -150,12 +183,18 @@ class Binary:
         self.path = os.path.abspath(path)
 
 
+class Pair:
+    def __init__(self, client, server):
+        self.client = client
+        self.server = server
+        self.label = "%s-%s" % (client.label, server.label)
+
+
 class Bench:
     def __init__(self, old_knc, new_knc):
-        self.binaries = [
-            Binary("old", old_knc),
-            Binary("new", new_knc),
-        ]
+        self.old = Binary("old", old_knc)
+        self.new = Binary("new", new_knc)
+        self.binaries = [self.old, self.new]
         self.tmp = tempfile.TemporaryDirectory(prefix="knc-bench.")
         self.tmpdir = self.tmp.name
         self.helper = os.path.join(self.tmpdir, "knc_bench_helper.py")
@@ -242,7 +281,21 @@ class Bench:
                 (" ".join(argv), proc.returncode, proc.stdout, proc.stderr)
             )
 
-    def start_server(self, binary, case, side):
+    def pairs(self, mode):
+        if mode == "same":
+            return [
+                Pair(self.old, self.old),
+                Pair(self.new, self.new),
+            ]
+
+        return [
+            Pair(self.old, self.old),
+            Pair(self.new, self.old),
+            Pair(self.old, self.new),
+            Pair(self.new, self.new),
+        ]
+
+    def start_server(self, pair, case, side):
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         listener.bind(("127.0.0.1", 0))
@@ -250,7 +303,7 @@ class Bench:
         listener.close()
 
         argv = [
-            binary.path,
+            pair.server.path,
             "-l",
             "-f",
             "-M", "1",
@@ -273,12 +326,12 @@ class Bench:
             stdout, stderr = proc.communicate()
             raise BenchError(
                 "%s server failed to start for %s\nstdout:\n%s\nstderr:\n%s" %
-                (binary.label, case.name, show(stdout), show(stderr))
+                (pair.label, case.name, show(stdout), show(stderr))
             )
         return proc, port
 
-    def run_client(self, binary, port, input_data):
-        argv = [binary.path, "host@127.0.0.1", str(port)]
+    def run_client(self, pair, port, input_data):
+        argv = [pair.client.path, "host@127.0.0.1", str(port)]
         client = subprocess.Popen(
             argv,
             env=self.env("client"),
@@ -293,16 +346,16 @@ class Bench:
             stdout, stderr = client.communicate()
             raise BenchError(
                 "%s client timed out\nstdout:\n%s\nstderr:\n%s" %
-                (binary.label, show(stdout), show(stderr))
+                (pair.label, show(stdout), show(stderr))
             )
         if client.returncode != 0:
             raise BenchError(
                 "%s client failed with %d\nstdout:\n%s\nstderr:\n%s" %
-                (binary.label, client.returncode, show(stdout), show(stderr))
+                (pair.label, client.returncode, show(stdout), show(stderr))
             )
         return stdout
 
-    def finish_server(self, binary, case, server):
+    def finish_server(self, pair, case, server):
         try:
             stdout, stderr = server.communicate(timeout=TIMEOUT)
         except subprocess.TimeoutExpired:
@@ -310,25 +363,25 @@ class Bench:
             stdout, stderr = server.communicate()
             raise BenchError(
                 "%s server timed out for %s\nstdout:\n%s\nstderr:\n%s" %
-                (binary.label, case.name, show(stdout), show(stderr))
+                (pair.label, case.name, show(stdout), show(stderr))
             )
         if server.returncode not in (0, 1):
             raise BenchError(
                 "%s server failed with %d for %s\nstdout:\n%s\nstderr:\n%s" %
-                (binary.label, server.returncode, case.name,
+                (pair.label, server.returncode, case.name,
                  show(stdout), show(stderr))
             )
 
-    def run_once(self, binary, case, number):
+    def run_once(self, pair, case, number, input_data):
         side = os.path.join(
             self.tmpdir,
-            "%s.%s.%d.json" % (binary.label, case.name, number),
+            "%s.%s.%d.json" % (pair.label, case.name, number),
         )
-        server, port = self.start_server(binary, case, side)
+        server, port = self.start_server(pair, case, side)
         try:
             start = time.perf_counter()
-            stdout = self.run_client(binary, port, case.input_data)
-            self.finish_server(binary, case, server)
+            stdout = self.run_client(pair, port, input_data)
+            self.finish_server(pair, case, server)
             elapsed = time.perf_counter() - start
         finally:
             if server.poll() is None:
@@ -387,44 +440,97 @@ def throughput(total_bytes, elapsed):
     return total_bytes / elapsed / MIB
 
 
+def parse_sizes_mib(value):
+    sizes = []
+    for part in value.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        size = int(part)
+        if size <= 0:
+            raise argparse.ArgumentTypeError(
+                "sizes must be positive MiB values"
+            )
+        sizes.append(size * MIB)
+    if not sizes:
+        raise argparse.ArgumentTypeError("empty size list")
+    return sizes
+
+
+def parse_cases(value):
+    valid = {"tiny", "upload", "download", "duplex"}
+    cases = []
+    for part in value.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if part not in valid:
+            raise argparse.ArgumentTypeError(
+                "unknown case %s, expected one of %s" %
+                (part, ",".join(sorted(valid)))
+            )
+        cases.append(part)
+    if not cases:
+        raise argparse.ArgumentTypeError("empty case list")
+    return cases
+
+
 def default_cases(args):
-    return [
-        Case("tiny-echo", "echo", 1, 1),
-        Case("upload-%dm" % (args.bulk_size // MIB), "sink",
-             args.bulk_size, 0),
-        Case("download-%dm" % (args.bulk_size // MIB), "source",
-             0, args.bulk_size, [str(args.bulk_size)]),
-        Case("duplex-%dm" % (args.duplex_size // MIB), "duplex",
-             args.duplex_size, args.duplex_size, [str(args.duplex_size)]),
-    ]
+    cases = []
+
+    if "tiny" in args.cases:
+        cases.append(Case("tiny-echo", "echo", 1, 1))
+
+    if args.sizes_mib is None:
+        bulk_sizes = [args.bulk_size]
+        duplex_sizes = [args.duplex_size]
+    else:
+        bulk_sizes = args.sizes_mib
+        duplex_sizes = args.sizes_mib
+
+    for size in bulk_sizes:
+        mib = size // MIB
+        if "upload" in args.cases:
+            cases.append(Case("upload-%dm" % mib, "sink", size, 0))
+        if "download" in args.cases:
+            cases.append(Case("download-%dm" % mib, "source",
+                              0, size, [str(size)]))
+
+    for size in duplex_sizes:
+        mib = size // MIB
+        if "duplex" in args.cases:
+            cases.append(Case("duplex-%dm" % mib, "duplex",
+                              size, size, [str(size)]))
+
+    return cases
 
 
-def print_results(results, cases, binaries):
+def print_results(results, cases, pairs):
     print("")
     print("%-14s %-8s %10s %10s %10s" %
-          ("case", "binary", "median-s", "min-s", "MiB/s"))
+          ("case", "pair", "median-s", "min-s", "MiB/s"))
     print("%-14s %-8s %10s %10s %10s" %
           ("-" * 14, "-" * 8, "-" * 10, "-" * 10, "-" * 10))
     for case in cases:
-        for binary in binaries:
-            values = results[(case.name, binary.label)]
+        for pair in pairs:
+            values = results[(case.name, pair.label)]
             med = median(values)
             print("%-14s %-8s %10.4f %10.4f %10.2f" %
-                  (case.name, binary.label, med, min(values),
+                  (case.name, pair.label, med, min(values),
                    throughput(case.total_bytes, med)))
 
     print("")
-    print("%-14s %10s %12s %12s" %
-          ("case", "new/old-s", "old-MiB/s", "new-MiB/s"))
-    print("%-14s %10s %12s %12s" %
-          ("-" * 14, "-" * 10, "-" * 12, "-" * 12))
+    print("%-14s %-8s %12s %12s" %
+          ("case", "pair", "vs-oldold", "MiB/s"))
+    print("%-14s %-8s %12s %12s" %
+          ("-" * 14, "-" * 8, "-" * 12, "-" * 12))
     for case in cases:
-        old_med = median(results[(case.name, "old")])
-        new_med = median(results[(case.name, "new")])
-        old_tput = throughput(case.total_bytes, old_med)
-        new_tput = throughput(case.total_bytes, new_med)
-        print("%-14s %10.3f %12.2f %12.2f" %
-              (case.name, new_med / old_med, old_tput, new_tput))
+        base = median(results[(case.name, "old-old")])
+        for pair in pairs:
+            med = median(results[(case.name, pair.label)])
+            print("%-14s %-8s %12.3f %12.2f" %
+                  (case.name, pair.label, med / base,
+                   throughput(case.total_bytes, med)))
 
 
 def parse_args():
@@ -456,6 +562,19 @@ def parse_args():
         "--duplex-size", type=int, default=4 * MIB,
         help="bytes in each direction for duplex case",
     )
+    parser.add_argument(
+        "--sizes-mib", type=parse_sizes_mib,
+        help="comma-separated MiB sizes for upload/download/duplex cases",
+    )
+    parser.add_argument(
+        "--cases", type=parse_cases,
+        default=parse_cases("tiny,upload,download,duplex"),
+        help="comma-separated cases: tiny,upload,download,duplex",
+    )
+    parser.add_argument(
+        "--pairs", choices=["same", "mixed"], default="same",
+        help="same runs old-old and new-new; mixed runs all client/server pairs",
+    )
     return parser.parse_args()
 
 
@@ -470,29 +589,32 @@ def main():
     try:
         bench.setup()
         cases = default_cases(args)
+        pairs = bench.pairs(args.pairs)
         results = {}
 
         print("old: %s" % os.path.abspath(args.old_knc))
         print("new: %s" % os.path.abspath(args.new_knc))
         print("iterations: %d, warmups: %d" %
               (args.iterations, args.warmups))
+        print("pairs: %s" % ", ".join(pair.label for pair in pairs))
 
         for case in cases:
             print("case: %s" % case.name)
+            input_data = case.input_data()
             for _ in range(args.warmups):
-                for binary in bench.binaries:
-                    bench.run_once(binary, case, -1)
+                for pair in pairs:
+                    bench.run_once(pair, case, -1, input_data)
 
             for i in range(args.iterations):
-                for binary in bench.binaries:
-                    elapsed = bench.run_once(binary, case, i)
+                for pair in pairs:
+                    elapsed = bench.run_once(pair, case, i, input_data)
                     results.setdefault(
-                        (case.name, binary.label), []
+                        (case.name, pair.label), []
                     ).append(elapsed)
-                    print("  %-3s iter %d: %.4fs" %
-                          (binary.label, i + 1, elapsed))
+                    print("  %-8s iter %d: %.4fs" %
+                          (pair.label, i + 1, elapsed))
 
-        print_results(results, cases, bench.binaries)
+        print_results(results, cases, pairs)
     finally:
         bench.close()
 
