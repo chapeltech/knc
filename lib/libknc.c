@@ -267,6 +267,13 @@ static int	knc_state_session(knc_ctx, void *, size_t);
 static int	knc_state_command(knc_ctx, void *, size_t);
 static int	knc_state_process_in(knc_ctx);
 static int	knc_state_process_out(knc_ctx);
+static void	knc_discard_empty_input(knc_ctx, int);
+static void	knc_remote_read_eof(knc_ctx);
+static void	knc_remote_write_eof(knc_ctx);
+static void	knc_local_read_eof(knc_ctx);
+static void	knc_local_write_eof(knc_ctx);
+static void	knc_network_read_eof(knc_ctx);
+static void	knc_network_write_eof(knc_ctx);
 
 static stream	knc_find_buf(knc_ctx, int, int);
 
@@ -1190,6 +1197,7 @@ knc_get_opt(knc_ctx ctx, unsigned opt)
 
 	switch (opt) {
 	case KNC_OPT_NOPRIVACY:
+	case KNC_OPT_NO_HALF_CLOSE:
 	case KNC_SOCK_NONBLOCK:
 	case KNC_SOCK_CLOEXEC:
 		return (ctx->opts & opt) ? 1 : 0;
@@ -1218,6 +1226,7 @@ knc_set_opt(knc_ctx ctx, unsigned opt, int value)
 	switch (opt) {
 	/* We handle all of the flag-options together: */
 	case KNC_OPT_NOPRIVACY:
+	case KNC_OPT_NO_HALF_CLOSE:
 	case KNC_OPT_SENDCMDS:
 	case KNC_SOCK_NONBLOCK:
 	case KNC_SOCK_CLOEXEC:
@@ -2122,26 +2131,21 @@ knc_state_command(knc_ctx ctx, void *buf, size_t len)
 	if (out.length == 0) {
 		knc_debugf(ctx, "knc_state_command: received dual EOF\n");
 		/* XXXrcd: should check if we've sent EOF not if we're open */
-		if (ctx->open & OPEN_WRITE)
-			knc_put_eof(ctx, KNC_DIR_SEND);
-		if (ctx->open & OPEN_READ)
-			knc_put_eof(ctx, KNC_DIR_RECV);
-		ctx->open &= ~(OPEN_READ|OPEN_WRITE);
+		knc_remote_read_eof(ctx);
+		knc_remote_write_eof(ctx);
 		goto done;
 	}
 
 	if (out.length == 1 && *(char *)out.value == 0) {
 		knc_debugf(ctx, "knc_state_command: received read EOF\n");
-		ctx->open &= ~OPEN_READ;
+		knc_remote_read_eof(ctx);
 		goto done;
 	}
 
 	if (out.length == 1 && *(char *)out.value == 1) {
 		/* XXXrcd: should check if we've sent EOF not if we're open */
 		knc_debugf(ctx, "knc_state_command: received write EOF\n");
-		if (ctx->open & OPEN_WRITE)
-			knc_put_eof(ctx, KNC_DIR_SEND);
-		ctx->open &= ~OPEN_WRITE;
+		knc_remote_write_eof(ctx);
 		goto done;
 	}
 
@@ -2167,6 +2171,89 @@ knc_state_command(knc_ctx ctx, void *buf, size_t len)
 done:
 	gss_release_buffer(&min, &out);
 	return 0;
+}
+
+static void
+knc_discard_empty_input(knc_ctx ctx, int dir)
+{
+	stream	s;
+
+	if (dir == KNC_DIR_SEND)
+		s = &ctx->raw_send;
+	else
+		s = &ctx->raw_recv;
+
+	if (s && s->cur && s->cur->len == 0)
+		stream_drain(s, 0);
+}
+
+static void
+knc_remote_read_eof(knc_ctx ctx)
+{
+
+	ctx->open &= ~OPEN_READ;
+
+	if ((ctx->opts & KNC_OPT_NO_HALF_CLOSE) && (ctx->open & OPEN_WRITE))
+		knc_put_eof(ctx, KNC_DIR_SEND);
+}
+
+static void
+knc_remote_write_eof(knc_ctx ctx)
+{
+
+	if (ctx->open & OPEN_WRITE)
+		knc_put_eof(ctx, KNC_DIR_SEND);
+
+	ctx->open &= ~OPEN_WRITE;
+
+	if (ctx->opts & KNC_OPT_NO_HALF_CLOSE)
+		ctx->open &= ~OPEN_READ;
+}
+
+static void
+knc_local_read_eof(knc_ctx ctx)
+{
+
+	if (ctx->open & OPEN_WRITE)
+		knc_put_eof(ctx, KNC_DIR_SEND);
+
+	if ((ctx->opts & KNC_OPT_NO_HALF_CLOSE) && (ctx->open & OPEN_READ)) {
+		knc_put_eof(ctx, KNC_DIR_RECV);
+		ctx->open &= ~OPEN_READ;
+	}
+}
+
+static void
+knc_local_write_eof(knc_ctx ctx)
+{
+
+	if (ctx->open & OPEN_READ) {
+		knc_put_eof(ctx, KNC_DIR_RECV);
+		ctx->open &= ~OPEN_READ;
+	}
+
+	if ((ctx->opts & KNC_OPT_NO_HALF_CLOSE) && (ctx->open & OPEN_WRITE))
+		knc_put_eof(ctx, KNC_DIR_SEND);
+}
+
+static void
+knc_network_read_eof(knc_ctx ctx)
+{
+
+	ctx->open &= ~OPEN_READ;
+
+	if ((ctx->opts & KNC_OPT_NO_HALF_CLOSE) && (ctx->open & OPEN_WRITE))
+		knc_put_eof(ctx, KNC_DIR_SEND);
+}
+
+static void
+knc_network_write_eof(knc_ctx ctx)
+{
+
+	ctx->open &= ~OPEN_WRITE;
+
+	if (ctx->opts & KNC_OPT_NO_HALF_CLOSE)
+		ctx->open &= ~OPEN_READ;
 }
 
 static int
@@ -2915,6 +3002,12 @@ knc_need_input(knc_ctx ctx, int dir)
 	if (!ctx)
 		return 0;
 
+	if (dir == KNC_DIR_RECV && !(ctx->open & OPEN_READ))
+		return 0;
+
+	if (dir == KNC_DIR_SEND && !(ctx->open & OPEN_WRITE))
+		return 0;
+
 	/*
 	 * We only check the amount of data we have decrypted, because
 	 * we could lockup if we don't try to read when we have a
@@ -3170,6 +3263,22 @@ knc_fill(knc_ctx ctx, int dir)
 
 	if (ret == 0) {
 		knc_debugf(ctx, "knc_fill: got EOF\n");
+		knc_discard_empty_input(ctx, dir);
+
+		if (dir == KNC_DIR_SEND) {
+			knc_local_read_eof(ctx);
+			knc_garbage_collect(ctx);
+			return 0;
+		}
+
+		if ((ctx->state == STATE_SESSION ||
+		     ctx->state == STATE_COMMAND) &&
+		    stream_avail(&ctx->raw_recv) == 0) {
+			knc_network_read_eof(ctx);
+			knc_garbage_collect(ctx);
+			return 0;
+		}
+
 		/*
 		 * XXXrcd: we may very well call this an error because
 		 *         we are supposed to see an appropriate command
@@ -3208,6 +3317,7 @@ knc_flush(knc_ctx ctx, int dir, size_t flushlen)
 	struct iovec	 *vec;
 	int		  iovcnt;
 	size_t		  completelen = 0;
+	size_t		  outlen;
 	ssize_t		  len;
 	size_t		 *total;
 	ssize_t		(*ourwritev)(void *, const struct iovec *, int);
@@ -3235,12 +3345,23 @@ knc_flush(knc_ctx ctx, int dir, size_t flushlen)
 		len = knc_get_obufv(ctx, dir, MAX_IOVCNT, &vec, &iovcnt);
 		if (len <= 0)
 			break;
-		knc_debugf(ctx, "knc_flush: about to write %zu bytes.\n", len);
+		outlen = (size_t)len;
+		knc_debugf(ctx, "knc_flush: about to write %zu bytes.\n",
+		    outlen);
 
 		len = ourwritev(ourcookie, vec, iovcnt);
 
 		if (len == -1) {
 			knc_debugf(ctx, "write error: %s\n", strerror(errno));
+			if (errno == EPIPE) {
+				knc_drain_buf(ctx, dir, outlen);
+				if (dir == KNC_DIR_RECV)
+					knc_local_write_eof(ctx);
+				else
+					knc_network_write_eof(ctx);
+				knc_garbage_collect(ctx);
+				return 0;
+			}
 			return errno_switch(ctx, errno, "writev");
 		}
 

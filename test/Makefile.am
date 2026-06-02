@@ -4,8 +4,10 @@ AM_CPPFLAGS = -I$(top_srcdir)/lib $(WFLAGS) $(GSSAPI_CFLAGS)
 LDADD = ../lib/libknc.la
 
 bin_PROGRAMS = unit unit-simple testknc servefile
-check_PROGRAMS = unit-pollfds
-TESTS = unit-pollfds
+check_PROGRAMS = unit-pollfds unit-eof
+TESTS = unit-pollfds unit-eof
+
+unit_eof_LDADD = $(GSSAPI_LIBS)
 
 check_PROGRAMS = unit-stream
 TESTS = unit-stream
