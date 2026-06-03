@@ -312,6 +312,11 @@ parse_opt(const char *prognam, const char *opt)
 		return;
 	}
 
+	if (!strcmp(opt, "lz4") || !strcmp(opt, "compress-lz4")) {
+		prefs.compress_lz4 = 1;
+		return;
+	}
+
 	if (!strncmp(opt, "syslog-ident=", strlen("syslog-ident="))) {
 		opt += strlen("syslog-ident=");
 		if (!*opt) {
@@ -357,6 +362,7 @@ usage(const char *progname)
 		"connexions to process\n");
 	fprintf(stderr, "\t-N <num>\tuse fd <num> as network file "
 		"descriptor (in client mode)\n");
+	fprintf(stderr, "\t-o lz4\t\tenable LZ4 compression\n");
 	fprintf(stderr, "\t-P <sprinc>\tin client mode specify Kerberos "
 		"principal for server\n");
 	fprintf(stderr, "\t-S <path>\tconnect to Unix domain socket "
@@ -975,6 +981,7 @@ app_ctx_init(void)
 
 	knc_set_opt(ctx, KNC_OPT_NOPRIVACY, prefs.noprivacy);
 	knc_set_opt(ctx, KNC_OPT_NO_HALF_CLOSE, prefs.no_half_close);
+	knc_set_opt(ctx, KNC_OPT_COMPRESS_LZ4, prefs.compress_lz4);
 	knc_set_debug(ctx, prefs.debug_level >= LOG_DEBUG);
 	knc_set_req_mech(ctx, global_mech);
 

@@ -77,6 +77,7 @@ void		knc_set_opt(knc_ctx, unsigned, int);
 #define	KNC_OPT_NOPRIVATE	KNC_OPT_NOPRIVACY
 #define KNC_OPT_SENDCMDS	0x0008
 #define KNC_OPT_NO_HALF_CLOSE	0x0010
+#define KNC_OPT_COMPRESS_LZ4	0x0020
 
 /* The following options are ints rather than boolean */
 

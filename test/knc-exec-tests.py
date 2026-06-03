@@ -29,6 +29,7 @@ CLIENT_PASSWORD = "knc-exec-client-password"
 MASTER_PASSWORD = "knc-exec-master-password"
 KNC_TIMEOUT = 20
 OUTPUT_LIMIT = 4096
+LZ4_OPTS = ["-o", "lz4"]
 
 
 def output_text(data):
@@ -128,6 +129,11 @@ elif scenario == "stdin_binary":
 
 elif scenario == "stdout_binary":
     data = payload(65537)
+    write_all(data)
+    write_json(side, digest(data))
+
+elif scenario == "stdout_zeros":
+    data = b"\x00" * (512 * 1024 + 31)
     write_all(data)
     write_json(side, digest(data))
 
@@ -668,12 +674,13 @@ class KNCExecTests(unittest.TestCase):
             remaining -= len(chunk)
         return b"".join(chunks)
 
-    def run_interactive_request_response(self):
+    def run_interactive_request_response(self, server_opts=(), client_opts=()):
         side = self.side_path("request_response.json")
-        server, port = self.start_server("request_response", side)
+        server, port = self.start_server(
+            "request_response", side, server_opts=server_opts)
         try:
             client = subprocess.Popen(
-                self.client_argv(port),
+                self.client_argv(port, client_opts),
                 env=self.client_env(),
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
@@ -796,6 +803,12 @@ class KNCExecTests(unittest.TestCase):
 
     def test_exec_request_response_before_close(self):
         side, out = self.run_interactive_request_response()
+        self.assertEqual(out, b"one:alphatwo:beta")
+        self.assertEqual(self.read_json(side), {"rest": ""})
+
+    def test_lz4_interactive_request_response_flushes_small_write(self):
+        side, out = self.run_interactive_request_response(
+            server_opts=LZ4_OPTS, client_opts=LZ4_OPTS)
         self.assertEqual(out, b"one:alphatwo:beta")
         self.assertEqual(self.read_json(side), {"rest": ""})
 
@@ -1016,6 +1029,33 @@ class KNCExecTests(unittest.TestCase):
         side, out, _, _, _ = self.run_session("stderr_not_tunneled")
         self.assertEqual(out, b"stdout-marker\n")
         self.assertEqual(self.read_json(side)["stderr"], "stderr-marker\n")
+
+    def test_lz4_compressible_client_to_server_stream(self):
+        data = b"\x00" * (512 * 1024 + 17)
+        side, out, _, _, _ = self.run_session(
+            "drain_before_eof", data,
+            server_opts=LZ4_OPTS, client_opts=LZ4_OPTS)
+        self.assertEqual(out, b"")
+        result = self.read_json(side)
+        self.assertEqual(result["len"], len(data))
+        self.assertEqual(result["sha256"], sha256(data))
+
+    def test_lz4_compressible_server_to_client_stream(self):
+        expected = b"\x00" * (512 * 1024 + 31)
+        side, out, _, _, _ = self.run_session(
+            "stdout_zeros", server_opts=LZ4_OPTS, client_opts=LZ4_OPTS)
+        self.assertEqual(out, expected)
+        result = self.read_json(side)
+        self.assertEqual(result["len"], len(expected))
+        self.assertEqual(result["sha256"], sha256(expected))
+
+    def test_lz4_client_half_close_still_permits_child_response(self):
+        data = b"\x00" * 65536
+        side, out, _, _, _ = self.run_session(
+            "client_half_close", data,
+            server_opts=LZ4_OPTS, client_opts=LZ4_OPTS)
+        self.assertEqual(out, b"after-eof:" + data)
+        self.assertEqual(self.read_json(side)["write_status"], "written")
 
     def test_no_half_close_drops_response_after_client_eof(self):
         data = b"no-half-close request"
