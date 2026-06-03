@@ -86,6 +86,109 @@ test_no_half_close_option(void)
 }
 
 static void
+test_max_recv_packet_option_enables_commands(void)
+{
+	knc_ctx	ctx;
+
+	ctx = knc_ctx_init();
+	check(ctx != NULL, "knc_ctx_init failed");
+	check(knc_get_opt(ctx, KNC_OPT_MAX_RECV_PACKET) ==
+	    KNC_DEFAULT_MAX_RECV_PACKET,
+	    "KNC_OPT_MAX_RECV_PACKET had wrong default");
+	check(!knc_get_opt(ctx, KNC_OPT_SENDCMDS),
+	    "KNC_OPT_SENDCMDS defaulted to enabled");
+
+	knc_set_opt(ctx, KNC_OPT_MAX_RECV_PACKET,
+	    KNC_DEFAULT_MAX_RECV_PACKET + 4096);
+	check(knc_get_opt(ctx, KNC_OPT_MAX_RECV_PACKET) ==
+	    KNC_DEFAULT_MAX_RECV_PACKET + 4096,
+	    "KNC_OPT_MAX_RECV_PACKET did not update");
+	check(knc_get_opt(ctx, KNC_OPT_SENDCMDS),
+	    "KNC_OPT_MAX_RECV_PACKET did not enable commands");
+
+	knc_ctx_destroy(ctx);
+}
+
+static void
+test_capability_command_updates_peer_recv_limit(void)
+{
+	knc_ctx		ctx;
+	const char	cap[] = "max_recv_packet=131072\n";
+	const char	small[] = "max_recv_packet=1024\n";
+
+	ctx = knc_ctx_init();
+	check(ctx != NULL, "knc_ctx_init failed");
+	check(ctx->peer_max_recv_packet == KNC_DEFAULT_MAX_RECV_PACKET,
+	    "peer max receive packet had wrong default");
+
+	cmd_capability(ctx, 0, (void *)small, strlen(small));
+	check(ctx->peer_max_recv_packet == KNC_DEFAULT_MAX_RECV_PACKET,
+	    "small peer max receive packet lowered legacy limit");
+
+	cmd_capability(ctx, 0, (void *)cap, strlen(cap));
+	check(ctx->peer_max_recv_packet == 131072,
+	    "capability did not update peer max receive packet");
+
+	knc_ctx_destroy(ctx);
+}
+
+static void
+test_read_packet_accepts_grace_over_local_recv_limit(void)
+{
+	knc_ctx		ctx;
+	void		*payload;
+	void		*buf;
+	size_t		 len;
+	size_t		 ret;
+	uint32_t	 netlen;
+
+	ctx = knc_ctx_init();
+	check(ctx != NULL, "knc_ctx_init failed");
+
+	len = KNC_DEFAULT_MAX_RECV_PACKET + KNC_PACKET_GRACE;
+	payload = calloc(1, len);
+	check(payload != NULL, "calloc failed");
+
+	netlen = htonl((uint32_t)len);
+	check(put_stream(&ctx->raw_recv, &netlen, sizeof(netlen)) ==
+	    sizeof(netlen), "packet length put failed");
+	check(put_stream(&ctx->raw_recv, payload, len) == len,
+	    "packet payload put failed");
+
+	ret = read_packet(ctx, &ctx->raw_recv, &buf);
+	check(ret == len, "packet grace was not accepted");
+	check_no_error(ctx, "packet grace set an error");
+
+	free(payload);
+	knc_ctx_destroy(ctx);
+}
+
+static void
+test_read_packet_rejects_beyond_local_recv_limit_grace(void)
+{
+	knc_ctx		ctx;
+	void		*buf;
+	size_t		 len;
+	size_t		 ret;
+	uint32_t	 netlen;
+
+	ctx = knc_ctx_init();
+	check(ctx != NULL, "knc_ctx_init failed");
+
+	len = KNC_DEFAULT_MAX_RECV_PACKET + KNC_PACKET_GRACE + 1;
+	netlen = htonl((uint32_t)len);
+	check(put_stream(&ctx->raw_recv, &netlen, sizeof(netlen)) ==
+	    sizeof(netlen), "packet length put failed");
+
+	ret = read_packet(ctx, &ctx->raw_recv, &buf);
+	check(ret == 0, "oversized packet returned data");
+	check(knc_error(ctx) == KNC_ERROR_PROTO,
+	    "oversized packet was not a protocol error");
+
+	knc_ctx_destroy(ctx);
+}
+
+static void
 test_local_read_eof_does_not_queue_command_by_default(void)
 {
 	knc_ctx	ctx;
@@ -488,6 +591,10 @@ main(void)
 {
 
 	test_no_half_close_option();
+	test_max_recv_packet_option_enables_commands();
+	test_capability_command_updates_peer_recv_limit();
+	test_read_packet_accepts_grace_over_local_recv_limit();
+	test_read_packet_rejects_beyond_local_recv_limit_grace();
 	test_local_read_eof_does_not_queue_command_by_default();
 	test_local_read_eof_queues_send_eof_with_commands();
 	test_no_half_close_local_read_eof_closes_both_sides_by_default();

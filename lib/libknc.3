@@ -418,6 +418,13 @@ plaintext bytes available to read.
 This is also used by
 .Fn knc_get_pollfds
 to determine which fds should be polled.
+.It KNC_OPT_MAX_RECV_PACKET int
+sets the maximum on-the-wire KNC packet size that this context will
+advertise as willing to receive.
+Peers that do not advertise this capability are treated as supporting
+only the legacy 64KB packet size.
+Setting this option above the legacy size enables command packets so
+that the capability can be sent.
 .El
 .Pp
 These options are manipulated using the following two functions:

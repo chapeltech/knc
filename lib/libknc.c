@@ -44,6 +44,7 @@
 #include <netdb.h>
 #include <signal.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
@@ -157,6 +158,10 @@ struct internal_knc_ctx {
 	int			 lz4_flush_pending;
 	LZ4F_compressionContext_t lz4_send_ctx;
 	LZ4F_decompressionContext_t lz4_recv_ctx;
+	int			 capabilities_sent;
+	int			 max_recv_packet_probed;
+	size_t			 local_max_recv_packet;
+	size_t			 peer_max_recv_packet;
 	int			 error;
 	int			 debug;
 	char			 debug_prefix[64];
@@ -269,15 +274,19 @@ static void	stream_garbage_collect(stream);
 
 static int	socket_options(int, int);
 static size_t	read_packet(knc_ctx, stream, void **b);
-static size_t	put_packet(knc_ctx, gss_buffer_t);
-static size_t	wrap_and_put_packet(knc_ctx, char *, size_t);
+static int	put_packet(knc_ctx, gss_buffer_t);
+static int	wrap_and_put_packet(knc_ctx, char *, size_t);
 static int	wrap_sushi_packet(knc_ctx);
+static int	knc_wrap_size_limit(knc_ctx, size_t, size_t *, int);
+static size_t	knc_effective_wrap_input_limit(knc_ctx, size_t);
+static int	knc_probe_max_recv_packet(knc_ctx);
 static int	knc_put_unwrapped_data(knc_ctx, gss_buffer_t);
 static int	knc_process_sushi_recv(knc_ctx);
 static int	knc_lz4_start_send(knc_ctx);
 static int	knc_lz4_compress_data(knc_ctx, void *, size_t);
 static int	knc_lz4_flush_send(knc_ctx);
 static int	knc_lz4_end_send(knc_ctx);
+static int	knc_queue_capabilities(knc_ctx);
 static int	knc_queue_lz4_request(knc_ctx);
 static void	knc_maybe_enable_lz4_send(knc_ctx, void *, size_t);
 static void	free_mallocbuf(void *, void *);
@@ -952,13 +961,28 @@ stream_garbage_collect(stream s)
 	s->collecting = 0;
 }
 
-#define KNC_MAX_PACKET_SLOP	512
+#define KNC_DEFAULT_MAX_RECV_PACKET	(64 * 1024)
+#define KNC_PACKET_GRACE_NYBBLES	512
+#define KNC_PACKET_GRACE		(KNC_PACKET_GRACE_NYBBLES / 2)
+#define KNC_WRAP_LIMIT_SEARCH_STEP	256
+#define KNC_WRAP_LIMIT_SEARCH_MAX	(16 * 1024)
 
 #define KNC_LZ4_INPUT_CHUNK	(64 * 1024)
 #define KNC_LZ4_OUTPUT_CHUNK	(64 * 1024)
 
+#define KNC_CMD_CAPABILITY	"capability"
 #define KNC_CMD_LZ4_REQUEST	"compress_lz4"
 #define KNC_CMD_LZ4_ACK		"compress_lz4_ok"
+
+static size_t
+packet_limit_with_grace(size_t limit)
+{
+
+	if (limit > SIZE_MAX - KNC_PACKET_GRACE)
+		return SIZE_MAX;
+
+	return limit + KNC_PACKET_GRACE;
+}
 
 static size_t
 read_packet(knc_ctx ctx, stream s, void **buf)
@@ -974,7 +998,7 @@ read_packet(knc_ctx ctx, stream s, void **buf)
 		return 0;
 
 	wirelen = ntohl(*((uint32_t *)tmp));
-	maxlen = ctx->sendmax + KNC_MAX_PACKET_SLOP;
+	maxlen = packet_limit_with_grace(ctx->local_max_recv_packet);
 
 	DEBUG((NULL, "read_packet: got wirelen = %u\n", wirelen));
 	if (wirelen > maxlen) {
@@ -1003,20 +1027,95 @@ read_packet(knc_ctx ctx, stream s, void **buf)
 	return len;
 }
 
-static size_t
-put_packet(knc_ctx ctx, gss_buffer_t buf)
+static int
+knc_wrap_size_limit(knc_ctx ctx, size_t wire_limit, size_t *plain_limit,
+    int set_error)
 {
-	uint32_t	netlen;
+	OM_uint32	 maj;
+	OM_uint32	 min;
+	OM_uint32	 input_size;
+	OM_uint32	 output_size;
+	int		 privacy = (ctx->opts & KNC_OPT_NOPRIVACY)?0:1;
 
-	netlen = htonl((uint32_t)buf->length);
-	put_stream(&ctx->cooked_send, &netlen, 4);
-	put_stream_gssbuf(&ctx->cooked_send, buf);
+	if (wire_limit > UINT32_MAX)
+		output_size = UINT32_MAX;
+	else
+		output_size = (OM_uint32)wire_limit;
 
-	/* XXXrcd: useful to return this?  What about errors? */
+	maj = gss_wrap_size_limit(&min, ctx->gssctx, privacy,
+	    GSS_C_QOP_DEFAULT, output_size, &input_size);
+
+	if (maj != GSS_S_COMPLETE) {
+		if (set_error)
+			knc_gss_error(ctx, maj, min, "gss_wrap_size_limit");
+		return -1;
+	}
+
+	*plain_limit = input_size;
 	return 0;
 }
 
 static size_t
+knc_effective_wrap_input_limit(knc_ctx ctx, size_t wanted)
+{
+	size_t	limit;
+
+	if (knc_wrap_size_limit(ctx, ctx->peer_max_recv_packet, &limit, 1) < 0)
+		return 0;
+
+	return MIN(wanted, limit);
+}
+
+static int
+knc_probe_max_recv_packet(knc_ctx ctx)
+{
+	size_t	plain_limit;
+	size_t	wire_limit;
+	size_t	max_wire_limit;
+
+	if (ctx->max_recv_packet_probed)
+		return 0;
+
+	ctx->max_recv_packet_probed = 1;
+	wire_limit = KNC_DEFAULT_MAX_RECV_PACKET;
+	max_wire_limit = KNC_DEFAULT_MAX_RECV_PACKET + KNC_WRAP_LIMIT_SEARCH_MAX;
+
+	while (wire_limit <= max_wire_limit) {
+		if (knc_wrap_size_limit(ctx, wire_limit, &plain_limit, 0) < 0)
+			return -1;
+		if (plain_limit >= KNC_DEFAULT_MAX_RECV_PACKET) {
+			if (ctx->local_max_recv_packet < wire_limit)
+				ctx->local_max_recv_packet = wire_limit;
+			return 0;
+		}
+		wire_limit += KNC_WRAP_LIMIT_SEARCH_STEP;
+	}
+
+	return -1;
+}
+
+static int
+put_packet(knc_ctx ctx, gss_buffer_t buf)
+{
+	uint32_t	netlen;
+
+	if (buf->length > ctx->peer_max_recv_packet ||
+	    buf->length > UINT32_MAX) {
+		knc_proto_error(ctx, "Wrapped packet exceeds peer limit");
+		return -1;
+	}
+
+	netlen = htonl((uint32_t)buf->length);
+	if (put_stream(&ctx->cooked_send, &netlen, 4) != 4 ||
+	    put_stream_gssbuf(&ctx->cooked_send, buf) != buf->length) {
+		knc_enomem(ctx);
+		return -1;
+	}
+
+	return 0;
+}
+
+static int
 wrap_and_put_packet(knc_ctx ctx, char *buf, size_t len)
 {
 	gss_buffer_desc	 in;
@@ -1030,7 +1129,7 @@ wrap_and_put_packet(knc_ctx ctx, char *buf, size_t len)
 	maj = gss_wrap(&min, ctx->gssctx, privacy, GSS_C_QOP_DEFAULT,
 	    &in, NULL, &out);
 
-	KNC_GSS_ERROR(ctx, maj, min, 0, "gss_wrap");
+	KNC_GSS_ERROR(ctx, maj, min, -1, "gss_wrap");
 
 	return put_packet(ctx, &out);
 }
@@ -1220,23 +1319,30 @@ static int
 wrap_sushi_packet(knc_ctx ctx)
 {
 	size_t		 len;
+	size_t		 limit;
 	void		*buf;
 
 	switch (knc_get_stream_bit_type(&ctx->sushi_send)) {
 	case STREAM_COMMAND:
 		buf = knc_get_stream_command(&ctx->sushi_send, &len);
-		wrap_and_put_packet(ctx, buf, 0);
-		wrap_and_put_packet(ctx, buf, len);
+		if (wrap_and_put_packet(ctx, buf, 0) < 0)
+			return -1;
+		if (wrap_and_put_packet(ctx, buf, len) < 0)
+			return -1;
 		knc_maybe_enable_lz4_send(ctx, buf, len);
 		return 1;
 
 	case STREAM_BUFFER:
-		len = get_ostream_contig(&ctx->sushi_send, &buf,
-		    ctx->gssmaxpacket);
+		limit = knc_effective_wrap_input_limit(ctx, ctx->gssmaxpacket);
+		if (limit < 1)
+			return -1;
+
+		len = get_ostream_contig(&ctx->sushi_send, &buf, limit);
 		if (len < 1)
 			return 0;
 
-		wrap_and_put_packet(ctx, buf, len);
+		if (wrap_and_put_packet(ctx, buf, len) < 0)
+			return -1;
 		stream_drain(&ctx->sushi_send, len);
 		return 1;
 
@@ -1275,6 +1381,8 @@ knc_ctx_init(void)
 	ret->sendinbufsiz = 65536;
 	ret->sendmax      = 65536;
 	ret->gssmaxpacket = 65536;
+	ret->local_max_recv_packet = KNC_DEFAULT_MAX_RECV_PACKET;
+	ret->peer_max_recv_packet  = KNC_DEFAULT_MAX_RECV_PACKET;
 
 	ret->raw_recv.bits_table    = ((uint32_t)1 << NUM_STREAM_BITS) - 1;
 	ret->sushi_recv.bits_table  = ((uint32_t)1 << NUM_STREAM_BITS) - 1;
@@ -1418,6 +1526,8 @@ knc_get_opt(knc_ctx ctx, unsigned opt)
 		return (int)ctx->sendinbufsiz;
 	case KNC_OPT_RECVINBUFSIZ:
 		return (int)ctx->recvinbufsiz;
+	case KNC_OPT_MAX_RECV_PACKET:
+		return (int)ctx->local_max_recv_packet;
 
 	default:
 		break;
@@ -1455,6 +1565,14 @@ knc_set_opt(knc_ctx ctx, unsigned opt, int value)
 
 	case KNC_OPT_RECVINBUFSIZ:
 		ctx->recvinbufsiz = value;
+		break;
+
+	case KNC_OPT_MAX_RECV_PACKET:
+		if (value > KNC_DEFAULT_MAX_RECV_PACKET) {
+			ctx->local_max_recv_packet = value;
+			ctx->opts |= KNC_OPT_SENDCMDS;
+			ctx->capabilities_sent = 0;
+		}
 		break;
 
 	default:
@@ -2022,6 +2140,79 @@ knc_state_session(knc_ctx ctx, void *buf, size_t len)
 	return 0;
 }
 
+static int
+parse_size_t_decimal(const char *buf, size_t len, size_t *ret)
+{
+	size_t	value;
+	size_t	i;
+	int	digit;
+
+	if (len == 0)
+		return 0;
+
+	value = 0;
+	for (i = 0; i < len; i++) {
+		if (buf[i] < '0' || buf[i] > '9')
+			return 0;
+		digit = buf[i] - '0';
+		if (value > (SIZE_MAX - digit) / 10)
+			return 0;
+		value = value * 10 + digit;
+	}
+
+	*ret = value;
+	return 1;
+}
+
+static void
+process_capability(knc_ctx ctx, const char *buf, size_t len)
+{
+	static const char	max_recv_packet[] = "max_recv_packet=";
+	size_t			value;
+	size_t			keylen;
+
+	keylen = sizeof(max_recv_packet) - 1;
+	if (len > keylen && memcmp(buf, max_recv_packet, keylen) == 0) {
+		if (!parse_size_t_decimal(buf + keylen, len - keylen, &value))
+			return;
+		if (value > ctx->peer_max_recv_packet)
+			ctx->peer_max_recv_packet = value;
+	}
+}
+
+/*ARGSUSED*/
+static int
+cmd_capability(knc_ctx ctx, uint32_t cmdseqno, void *data, size_t len)
+{
+	const char	*buf;
+	const char	*line;
+	const char	*end;
+	size_t		 linelen;
+
+	if (!data || len == 0)
+		return 0;
+
+	buf = data;
+	end = buf + len;
+
+	while (buf < end) {
+		line = memchr(buf, '\n', end - buf);
+		if (line)
+			linelen = line - buf;
+		else
+			linelen = end - buf;
+
+		if (linelen > 0)
+			process_capability(ctx, buf, linelen);
+
+		if (!line)
+			break;
+		buf = line + 1;
+	}
+
+	return 0;
+}
+
 /*ARGSUSED*/
 static int
 cmd_unknown(knc_ctx ctx, uint32_t cmdseqno, void *data, size_t len)
@@ -2082,6 +2273,7 @@ struct {
 	const char	*cmd;
 	process_command	 f;
 } string_cmds[] = {
+	{ KNC_CMD_CAPABILITY,	cmd_capability},
 	{ "dont_understand",	cmd_dont_understand},
 	{ "txt_error",		cmd_txt_error},
 	{ KNC_CMD_LZ4_REQUEST,	cmd_compress_lz4},
@@ -2260,6 +2452,32 @@ knc_state_command(knc_ctx ctx, void *buf, size_t len)
 
 done:
 	gss_release_buffer(&min, &out);
+	return 0;
+}
+
+static int
+knc_queue_capabilities(knc_ctx ctx)
+{
+	char	buf[64];
+	int	len;
+
+	if (!(ctx->opts & KNC_OPT_SENDCMDS))
+		return 0;
+	if (ctx->capabilities_sent)
+		return 0;
+
+	if (knc_probe_max_recv_packet(ctx) < 0)
+		knc_debugf(ctx, "could not probe max_recv_packet\n");
+
+	len = snprintf(buf, sizeof(buf), "max_recv_packet=%zu\n",
+	    ctx->local_max_recv_packet);
+	if (len < 0 || (size_t)len >= sizeof(buf)) {
+		knc_enomem(ctx);
+		return -1;
+	}
+
+	ctx->capabilities_sent = 1;
+	knc_put_command(ctx, KNC_CMD_CAPABILITY, 0, buf, (uint32_t)len);
 	return 0;
 }
 
@@ -2479,6 +2697,7 @@ static int
 knc_state_process_out(knc_ctx ctx)
 {
 	int		 rawtype;
+	int		 ret;
 
 	knc_debugf(ctx, "knc_state_process_out: enter\n");
 
@@ -2491,11 +2710,17 @@ knc_state_process_out(knc_ctx ctx)
 	if (ctx->state != STATE_SESSION && ctx->state != STATE_COMMAND)
 		return 0;
 
+	if (knc_queue_capabilities(ctx) < 0)
+		return -1;
 	knc_queue_lz4_request(ctx);
 
 	while (stream_avail(&ctx->cooked_send) < ctx->sendmax) {
 		if (knc_get_stream_bit_type(&ctx->sushi_send)) {
-			wrap_sushi_packet(ctx);
+			ret = wrap_sushi_packet(ctx);
+			if (ret < 0)
+				return -1;
+			if (ret == 0)
+				return 0;
 			continue;
 		}
 

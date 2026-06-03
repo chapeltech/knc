@@ -83,6 +83,7 @@ void		knc_set_opt(knc_ctx, unsigned, int);
 
 #define KNC_OPT_SENDINBUFSIZ	0x8001
 #define KNC_OPT_RECVINBUFSIZ	0x8002
+#define KNC_OPT_MAX_RECV_PACKET	0x8003
 
 int		knc_is_authenticated(knc_ctx);
 void		knc_set_cred(knc_ctx, gss_cred_id_t);
