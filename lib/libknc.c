@@ -39,6 +39,7 @@
 #define	__USE_GNU
 #include <fcntl.h>
 #undef	__USE_GNU
+#include <limits.h>
 #include <malloc.h>
 #include <netdb.h>
 #include <signal.h>
@@ -59,6 +60,7 @@
 #endif
 
 #include "libknc.h"
+#include "lz4frame.h"
 #include "private.h"
 
 #ifndef USE_STUB_GSS_WRAP 
@@ -146,6 +148,15 @@ struct internal_knc_ctx {
 #define STATE_INIT	0x2
 #define STATE_SESSION	0x3
 #define STATE_COMMAND	0x4
+	int			 lz4_request_sent;
+	int			 lz4_send_pending;
+	int			 lz4_send;
+	int			 lz4_recv;
+	int			 lz4_send_started;
+	int			 lz4_send_ended;
+	int			 lz4_flush_pending;
+	LZ4F_compressionContext_t lz4_send_ctx;
+	LZ4F_decompressionContext_t lz4_recv_ctx;
 	int			 error;
 	int			 debug;
 	char			 debug_prefix[64];
@@ -158,8 +169,15 @@ struct internal_knc_ctx {
 	size_t			 gssmaxpacket;
 
 	struct stream		 raw_recv;
+	/*
+	 * sushi_* is the session byte stream between local plaintext and
+	 * GSS packets.  Optional compression framing lives here; GSS packet
+	 * boundaries do not.
+	 */
+	struct stream		 sushi_recv;
 	struct stream		 cooked_recv;
 	struct stream		 raw_send;
+	struct stream		 sushi_send;
 	struct stream		 cooked_send;
 
 	/*
@@ -253,6 +271,16 @@ static int	socket_options(int, int);
 static size_t	read_packet(knc_ctx, stream, void **b);
 static size_t	put_packet(knc_ctx, gss_buffer_t);
 static size_t	wrap_and_put_packet(knc_ctx, char *, size_t);
+static int	wrap_sushi_packet(knc_ctx);
+static int	knc_put_unwrapped_data(knc_ctx, gss_buffer_t);
+static int	knc_process_sushi_recv(knc_ctx);
+static int	knc_lz4_start_send(knc_ctx);
+static int	knc_lz4_compress_data(knc_ctx, void *, size_t);
+static int	knc_lz4_flush_send(knc_ctx);
+static int	knc_lz4_end_send(knc_ctx);
+static int	knc_queue_lz4_request(knc_ctx);
+static void	knc_maybe_enable_lz4_send(knc_ctx, void *, size_t);
+static void	free_mallocbuf(void *, void *);
 
 static int	knc_state_init(knc_ctx, void *, size_t);
 static int	knc_state_accept(knc_ctx, void *, size_t);
@@ -477,6 +505,14 @@ free_gssbuf(void *buf, void *cookie)
 
 	gss_release_buffer(&min, cookie);
 	free(cookie);
+}
+
+/*ARGSUSED*/
+static void
+free_mallocbuf(void *buf, void *cookie)
+{
+
+	free(buf);
 }
 
 static size_t
@@ -918,6 +954,12 @@ stream_garbage_collect(stream s)
 
 #define KNC_MAX_PACKET_SLOP	512
 
+#define KNC_LZ4_INPUT_CHUNK	(64 * 1024)
+#define KNC_LZ4_OUTPUT_CHUNK	(64 * 1024)
+
+#define KNC_CMD_LZ4_REQUEST	"compress_lz4"
+#define KNC_CMD_LZ4_ACK		"compress_lz4_ok"
+
 static size_t
 read_packet(knc_ctx ctx, stream s, void **buf)
 {
@@ -993,6 +1035,218 @@ wrap_and_put_packet(knc_ctx ctx, char *buf, size_t len)
 	return put_packet(ctx, &out);
 }
 
+static void
+knc_lz4_preferences(LZ4F_preferences_t *prefs)
+{
+
+	memset(prefs, 0, sizeof(*prefs));
+	prefs->frameInfo.blockSizeID = LZ4F_max64KB;
+	prefs->frameInfo.blockMode = LZ4F_blockLinked;
+	prefs->compressionLevel = 0;
+	prefs->autoFlush = 0;
+}
+
+static int
+knc_lz4_error(knc_ctx ctx, size_t code, const char *what)
+{
+
+	if (!LZ4F_isError(code))
+		return 0;
+
+	knc_proto_error(ctx, "%s: %s", what, LZ4F_getErrorName(code));
+	return -1;
+}
+
+static int
+put_malloc_stream(knc_ctx ctx, stream s, void *buf, size_t len)
+{
+
+	if (len == 0) {
+		free(buf);
+		return 0;
+	}
+
+	if (put_stream_userbuf(s, buf, len, free_mallocbuf, NULL) == len)
+		return 0;
+
+	free(buf);
+	knc_enomem(ctx);
+	return -1;
+}
+
+static int
+knc_lz4_start_send(knc_ctx ctx)
+{
+	LZ4F_preferences_t	 prefs;
+	void			*buf;
+	size_t			 ret;
+
+	if (ctx->lz4_send_started)
+		return 0;
+
+	if (ctx->lz4_send_ended) {
+		knc_proto_error(ctx, "LZ4 data after compression end");
+		return -1;
+	}
+
+	if (!ctx->lz4_send_ctx) {
+		ret = LZ4F_createCompressionContext(&ctx->lz4_send_ctx,
+		    LZ4F_VERSION);
+		if (knc_lz4_error(ctx, ret,
+		    "LZ4F_createCompressionContext") < 0)
+			return -1;
+	}
+
+	buf = malloc(LZ4F_HEADER_SIZE_MAX);
+	if (!buf) {
+		knc_enomem(ctx);
+		return -1;
+	}
+
+	knc_lz4_preferences(&prefs);
+	ret = LZ4F_compressBegin(ctx->lz4_send_ctx, buf,
+	    LZ4F_HEADER_SIZE_MAX, &prefs);
+	if (knc_lz4_error(ctx, ret, "LZ4F_compressBegin") < 0) {
+		free(buf);
+		return -1;
+	}
+
+	ctx->lz4_send_started = 1;
+	return put_malloc_stream(ctx, &ctx->sushi_send, buf, ret);
+}
+
+static int
+knc_lz4_compress_data(knc_ctx ctx, void *inbuf, size_t len)
+{
+	LZ4F_compressOptions_t	 opts;
+	LZ4F_preferences_t	 prefs;
+	void			*outbuf;
+	size_t			 cap;
+	size_t			 ret;
+
+	if (knc_lz4_start_send(ctx) < 0)
+		return -1;
+
+	knc_lz4_preferences(&prefs);
+	cap = LZ4F_compressBound(len, &prefs);
+	outbuf = malloc(cap);
+	if (!outbuf) {
+		knc_enomem(ctx);
+		return -1;
+	}
+
+	memset(&opts, 0, sizeof(opts));
+	ret = LZ4F_compressUpdate(ctx->lz4_send_ctx, outbuf, cap,
+	    inbuf, len, &opts);
+	if (knc_lz4_error(ctx, ret, "LZ4F_compressUpdate") < 0) {
+		free(outbuf);
+		return -1;
+	}
+
+	ctx->lz4_flush_pending = 1;
+	return put_malloc_stream(ctx, &ctx->sushi_send, outbuf, ret);
+}
+
+static int
+knc_lz4_flush_send(knc_ctx ctx)
+{
+	LZ4F_compressOptions_t	 opts;
+	LZ4F_preferences_t	 prefs;
+	void			*buf;
+	size_t			 cap;
+	size_t			 ret;
+
+	if (!ctx->lz4_flush_pending || !ctx->lz4_send_started)
+		return 0;
+
+	knc_lz4_preferences(&prefs);
+	cap = LZ4F_compressBound(0, &prefs);
+	buf = malloc(cap);
+	if (!buf) {
+		knc_enomem(ctx);
+		return -1;
+	}
+
+	memset(&opts, 0, sizeof(opts));
+	ret = LZ4F_flush(ctx->lz4_send_ctx, buf, cap, &opts);
+	if (knc_lz4_error(ctx, ret, "LZ4F_flush") < 0) {
+		free(buf);
+		return -1;
+	}
+
+	ctx->lz4_flush_pending = 0;
+	return put_malloc_stream(ctx, &ctx->sushi_send, buf, ret);
+}
+
+static int
+knc_lz4_end_send(knc_ctx ctx)
+{
+	LZ4F_compressOptions_t	 opts;
+	LZ4F_preferences_t	 prefs;
+	void			*buf;
+	size_t			 cap;
+	size_t			 ret;
+
+	if (ctx->lz4_send_ended)
+		return 0;
+
+	if (!ctx->lz4_send_started) {
+		ctx->lz4_send_ended = 1;
+		ctx->lz4_flush_pending = 0;
+		return 0;
+	}
+
+	knc_lz4_preferences(&prefs);
+	cap = LZ4F_compressBound(0, &prefs);
+	buf = malloc(cap);
+	if (!buf) {
+		knc_enomem(ctx);
+		return -1;
+	}
+
+	memset(&opts, 0, sizeof(opts));
+	ret = LZ4F_compressEnd(ctx->lz4_send_ctx, buf, cap, &opts);
+	if (knc_lz4_error(ctx, ret, "LZ4F_compressEnd") < 0) {
+		free(buf);
+		return -1;
+	}
+
+	ctx->lz4_send_ended = 1;
+	ctx->lz4_flush_pending = 0;
+	return put_malloc_stream(ctx, &ctx->sushi_send, buf, ret);
+}
+
+static int
+wrap_sushi_packet(knc_ctx ctx)
+{
+	size_t		 len;
+	void		*buf;
+
+	switch (knc_get_stream_bit_type(&ctx->sushi_send)) {
+	case STREAM_COMMAND:
+		buf = knc_get_stream_command(&ctx->sushi_send, &len);
+		wrap_and_put_packet(ctx, buf, 0);
+		wrap_and_put_packet(ctx, buf, len);
+		knc_maybe_enable_lz4_send(ctx, buf, len);
+		return 1;
+
+	case STREAM_BUFFER:
+		len = get_ostream_contig(&ctx->sushi_send, &buf,
+		    ctx->gssmaxpacket);
+		if (len < 1)
+			return 0;
+
+		wrap_and_put_packet(ctx, buf, len);
+		stream_drain(&ctx->sushi_send, len);
+		return 1;
+
+	default:
+		break;
+	}
+
+	return 0;
+}
+
 knc_ctx
 knc_ctx_init(void)
 {
@@ -1023,12 +1277,16 @@ knc_ctx_init(void)
 	ret->gssmaxpacket = 65536;
 
 	ret->raw_recv.bits_table    = ((uint32_t)1 << NUM_STREAM_BITS) - 1;
+	ret->sushi_recv.bits_table  = ((uint32_t)1 << NUM_STREAM_BITS) - 1;
 	ret->raw_send.bits_table    = ((uint32_t)1 << NUM_STREAM_BITS) - 1;
+	ret->sushi_send.bits_table  = ((uint32_t)1 << NUM_STREAM_BITS) - 1;
 	ret->cooked_recv.bits_table = ((uint32_t)1 << NUM_STREAM_BITS) - 1;
 	ret->cooked_send.bits_table = ((uint32_t)1 << NUM_STREAM_BITS) - 1;
 
 	ret->raw_recv.bufs_table    = ((uint32_t)1 << NUM_STREAM_BUFS) - 1;
+	ret->sushi_recv.bufs_table  = ((uint32_t)1 << NUM_STREAM_BUFS) - 1;
 	ret->raw_send.bufs_table    = ((uint32_t)1 << NUM_STREAM_BUFS) - 1;
+	ret->sushi_send.bufs_table  = ((uint32_t)1 << NUM_STREAM_BUFS) - 1;
 	ret->cooked_recv.bufs_table = ((uint32_t)1 << NUM_STREAM_BUFS) - 1;
 	ret->cooked_send.bufs_table = ((uint32_t)1 << NUM_STREAM_BUFS) - 1;
 
@@ -1082,10 +1340,14 @@ knc_ctx_destroy(knc_ctx ctx)
 	/* XXXnico: smartass comment: use valgrind */
 
 	free(ctx->errstr);
+	LZ4F_freeCompressionContext(ctx->lz4_send_ctx);
+	LZ4F_freeDecompressionContext(ctx->lz4_recv_ctx);
 
 	destroy_stream(&ctx->raw_recv);
+	destroy_stream(&ctx->sushi_recv);
 	destroy_stream(&ctx->cooked_recv);
 	destroy_stream(&ctx->raw_send);
+	destroy_stream(&ctx->sushi_send);
 	destroy_stream(&ctx->cooked_send);
 
 	free(ctx);
@@ -1147,6 +1409,7 @@ knc_get_opt(knc_ctx ctx, unsigned opt)
 	case KNC_OPT_NOPRIVACY:
 	case KNC_OPT_NO_HALF_CLOSE:
 	case KNC_OPT_SENDCMDS:
+	case KNC_OPT_COMPRESS_LZ4:
 	case KNC_SOCK_NONBLOCK:
 	case KNC_SOCK_CLOEXEC:
 		return (ctx->opts & opt) ? 1 : 0;
@@ -1177,6 +1440,7 @@ knc_set_opt(knc_ctx ctx, unsigned opt, int value)
 	case KNC_OPT_NOPRIVACY:
 	case KNC_OPT_NO_HALF_CLOSE:
 	case KNC_OPT_SENDCMDS:
+	case KNC_OPT_COMPRESS_LZ4:
 	case KNC_SOCK_NONBLOCK:
 	case KNC_SOCK_CLOEXEC:
 		if (value)
@@ -1200,6 +1464,23 @@ knc_set_opt(knc_ctx ctx, unsigned opt, int value)
 	/* Some options require additional actions: */
 
 	switch (opt) {
+	case KNC_OPT_COMPRESS_LZ4:
+		if (value)
+			ctx->opts |= KNC_OPT_SENDCMDS;
+		else {
+			ctx->lz4_request_sent = 0;
+			ctx->lz4_send_pending = 0;
+			ctx->lz4_send = 0;
+			ctx->lz4_recv = 0;
+			ctx->lz4_send_started = 0;
+			ctx->lz4_send_ended = 0;
+			ctx->lz4_flush_pending = 0;
+			LZ4F_freeCompressionContext(ctx->lz4_send_ctx);
+			LZ4F_freeDecompressionContext(ctx->lz4_recv_ctx);
+			ctx->lz4_send_ctx = NULL;
+			ctx->lz4_recv_ctx = NULL;
+		}
+		break;
 	case KNC_SOCK_NONBLOCK:
 	case KNC_SOCK_CLOEXEC:
 		if (ctx->net_uses_fd) {
@@ -1530,6 +1811,180 @@ knc_state_accept(knc_ctx ctx, void *buf, size_t len)
 }
 
 static int
+knc_put_unwrapped_data(knc_ctx ctx, gss_buffer_t out)
+{
+
+	if (!(ctx->open & OPEN_READ)) {
+		knc_proto_error(ctx, "Data after EOF");
+		return -1;
+	}
+
+	if (ctx->lz4_recv) {
+		if (put_stream_gssbuf(&ctx->sushi_recv, out) != out->length) {
+			knc_enomem(ctx);
+			return -1;
+		}
+		return knc_process_sushi_recv(ctx);
+	}
+
+	put_stream_gssbuf(&ctx->cooked_recv, out);
+	return 0;
+}
+
+static int
+knc_lz4_start_recv(knc_ctx ctx)
+{
+
+	if (ctx->lz4_recv_ctx)
+		return 0;
+
+	return knc_lz4_error(ctx,
+	    LZ4F_createDecompressionContext(&ctx->lz4_recv_ctx,
+	    LZ4F_VERSION), "LZ4F_createDecompressionContext");
+}
+
+static int
+knc_process_sushi_recv(knc_ctx ctx)
+{
+	LZ4F_decompressOptions_t	 opts;
+	void			*src;
+	void			*dst;
+	size_t			 srclen;
+	size_t			 dstlen;
+	size_t			 insize;
+	size_t			 outsize;
+	size_t			 ret;
+
+	if (!ctx->lz4_recv)
+		return 0;
+
+	if (knc_lz4_start_recv(ctx) < 0)
+		return -1;
+
+	for (;;) {
+		srclen = get_ostream(&ctx->sushi_recv, &src,
+		    stream_avail(&ctx->sushi_recv));
+		if (srclen < 1)
+			return 0;
+
+		dstlen = KNC_LZ4_OUTPUT_CHUNK;
+		dst = malloc(dstlen);
+		if (!dst) {
+			knc_enomem(ctx);
+			return -1;
+		}
+
+		insize = srclen;
+		outsize = dstlen;
+		memset(&opts, 0, sizeof(opts));
+		ret = LZ4F_decompress(ctx->lz4_recv_ctx, dst, &outsize,
+		    src, &insize, &opts);
+		if (knc_lz4_error(ctx, ret, "LZ4F_decompress") < 0) {
+			free(dst);
+			return -1;
+		}
+
+		if (insize > 0)
+			stream_drain(&ctx->sushi_recv, insize);
+
+		if (outsize > 0) {
+			if (put_malloc_stream(ctx, &ctx->cooked_recv, dst,
+			    outsize) < 0)
+				return -1;
+		} else
+			free(dst);
+
+		if (insize == 0 && outsize == 0)
+			return 0;
+
+		if (stream_avail(&ctx->sushi_recv) == 0)
+			return 0;
+	}
+
+	return 0;
+}
+
+static int
+knc_raw_command_is(knc_ctx ctx, unsigned char value)
+{
+	stream_bit	bit;
+
+	bit = ctx->raw_send.cur;
+	if (!bit || bit->type != STREAM_COMMAND || bit->len != 1)
+		return 0;
+
+	return *(unsigned char *)bit->buf == value;
+}
+
+static int
+knc_move_raw_command_to_sushi(knc_ctx ctx)
+{
+	size_t		 len;
+	void		*buf;
+
+	if (ctx->lz4_send_started) {
+		if (knc_raw_command_is(ctx, 0)) {
+			if (knc_lz4_end_send(ctx) < 0)
+				return -1;
+		} else if (ctx->lz4_flush_pending) {
+			if (knc_lz4_flush_send(ctx) < 0)
+				return -1;
+		}
+	}
+
+	buf = knc_get_stream_command(&ctx->raw_send, &len);
+	if (put_stream_command(&ctx->sushi_send, buf, len) != len) {
+		knc_enomem(ctx);
+		return -1;
+	}
+
+	return 0;
+}
+
+static int
+knc_move_raw_data_to_sushi(knc_ctx ctx)
+{
+	size_t		 len;
+	size_t		 wanted;
+	void		*buf;
+
+	wanted = ctx->lz4_send ? KNC_LZ4_INPUT_CHUNK : ctx->gssmaxpacket;
+	len = get_ostream_contig(&ctx->raw_send, &buf, wanted);
+
+	if (len < 1)
+		return 0;
+
+	if (ctx->lz4_send) {
+		if (knc_lz4_compress_data(ctx, buf, len) < 0)
+			return -1;
+	} else {
+		if (put_stream(&ctx->sushi_send, buf, len) != len) {
+			knc_enomem(ctx);
+			return -1;
+		}
+	}
+
+	stream_drain(&ctx->raw_send, len);
+	return 1;
+}
+
+static int
+knc_move_raw_to_sushi(knc_ctx ctx)
+{
+
+	switch (knc_get_stream_bit_type(&ctx->raw_send)) {
+	case STREAM_COMMAND:
+		return knc_move_raw_command_to_sushi(ctx);
+	case STREAM_BUFFER:
+		return knc_move_raw_data_to_sushi(ctx);
+	default:
+		break;
+	}
+
+	return 0;
+}
+
+static int
 knc_state_session(knc_ctx ctx, void *buf, size_t len)
 {
 	gss_buffer_desc	in;
@@ -1559,17 +2014,10 @@ knc_state_session(knc_ctx ctx, void *buf, size_t len)
 		return 0;
 	}
 
-	/*
-	 * Here, we know that we have data, so we need to decide if we
-	 * are in a position to accept it.
-	 */
-
-	if (!(ctx->open & OPEN_READ)) {
-		knc_proto_error(ctx, "Data after EOF");
+	if (knc_put_unwrapped_data(ctx, &out) < 0) {
+		gss_release_buffer(&min, &out);
 		return -1;
 	}
-
-	put_stream_gssbuf(&ctx->cooked_recv, &out);
 
 	return 0;
 }
@@ -1600,6 +2048,34 @@ cmd_txt_error(knc_ctx ctx, uint32_t cmdseqno, void *data, size_t len)
 	return 0;
 }
 
+/*ARGSUSED*/
+static int
+cmd_compress_lz4(knc_ctx ctx, uint32_t cmdseqno, void *data, size_t len)
+{
+
+	if (!(ctx->opts & KNC_OPT_COMPRESS_LZ4)) {
+		cmd_unknown(ctx, cmdseqno, data, len);
+		return 0;
+	}
+
+	knc_put_command(ctx, KNC_CMD_LZ4_ACK, cmdseqno, NULL, 0);
+	ctx->lz4_send_pending = 1;
+	return 0;
+}
+
+/*ARGSUSED*/
+static int
+cmd_compress_lz4_ok(knc_ctx ctx, uint32_t cmdseqno, void *data, size_t len)
+{
+
+	if (ctx->opts & KNC_OPT_COMPRESS_LZ4) {
+		ctx->lz4_recv = 1;
+		knc_lz4_start_recv(ctx);
+	}
+
+	return 0;
+}
+
 typedef int (*process_command)(knc_ctx, uint32_t, void *, size_t);
 
 struct {
@@ -1608,6 +2084,8 @@ struct {
 } string_cmds[] = {
 	{ "dont_understand",	cmd_dont_understand},
 	{ "txt_error",		cmd_txt_error},
+	{ KNC_CMD_LZ4_REQUEST,	cmd_compress_lz4},
+	{ KNC_CMD_LZ4_ACK,	cmd_compress_lz4_ok},
 	{ NULL,			NULL},
 
 	/* XXXrcd: send buffer size change requests? */
@@ -1785,6 +2263,69 @@ done:
 	return 0;
 }
 
+static int
+knc_queue_lz4_request(knc_ctx ctx)
+{
+
+	if (!(ctx->opts & KNC_OPT_COMPRESS_LZ4))
+		return 0;
+	if (!(ctx->opts & KNC_OPT_SENDCMDS))
+		return 0;
+	if (ctx->lz4_request_sent || ctx->lz4_recv)
+		return 0;
+
+	ctx->lz4_request_sent = 1;
+	knc_put_command(ctx, KNC_CMD_LZ4_REQUEST, 0, NULL, 0);
+	return 0;
+}
+
+static int
+knc_command_is(void *buf, size_t len, const char *cmd)
+{
+	char		*name;
+	char		*end;
+	uint32_t	 datalen;
+	size_t		 total;
+	size_t		 namelen;
+
+	if (len < sizeof(uint32_t) + 1 + sizeof(uint32_t))
+		return 0;
+
+	name = (char *)buf + sizeof(uint32_t);
+	end = memchr(name, 0, len - sizeof(uint32_t));
+	if (!end)
+		return 0;
+	namelen = end - name;
+	total = sizeof(uint32_t) + namelen + 1 + sizeof(uint32_t);
+	if (total > len)
+		return 0;
+	if (strcmp(name, cmd))
+		return 0;
+
+	memcpy(&datalen, name + namelen + 1, sizeof(datalen));
+	datalen = ntohl(datalen);
+	if (datalen > len - total || total + datalen != len)
+		return 0;
+
+	return 1;
+}
+
+static void
+knc_maybe_enable_lz4_send(knc_ctx ctx, void *buf, size_t len)
+{
+
+	if (!ctx->lz4_send_pending)
+		return;
+	if (!knc_command_is(buf, len, KNC_CMD_LZ4_ACK))
+		return;
+
+	ctx->lz4_send_pending = 0;
+	ctx->lz4_send = 1;
+	ctx->lz4_send_started = 0;
+	ctx->lz4_send_ended = 0;
+	ctx->lz4_flush_pending = 0;
+}
+
 static void
 knc_discard_empty_input(knc_ctx ctx, int dir)
 {
@@ -1937,8 +2478,7 @@ knc_state_process_in(knc_ctx ctx)
 static int
 knc_state_process_out(knc_ctx ctx)
 {
-	size_t		 len;
-	void		*buf;
+	int		 rawtype;
 
 	knc_debugf(ctx, "knc_state_process_out: enter\n");
 
@@ -1951,41 +2491,28 @@ knc_state_process_out(knc_ctx ctx)
 	if (ctx->state != STATE_SESSION && ctx->state != STATE_COMMAND)
 		return 0;
 
+	knc_queue_lz4_request(ctx);
+
 	while (stream_avail(&ctx->cooked_send) < ctx->sendmax) {
-		switch (knc_get_stream_bit_type(&ctx->raw_send)) {
-		case STREAM_COMMAND:
-			buf = knc_get_stream_command(&ctx->raw_send, &len);
-			wrap_and_put_packet(ctx, buf, 0);
-			wrap_and_put_packet(ctx, buf, len);
-			break;
-
-		case STREAM_BUFFER:
-			/*
-			 * We clip the length at ctx->gssmaxpacket to make
-			 * the job of the receiver easier.
-			 */
-
-			len = get_ostream_contig(&ctx->raw_send, &buf,
-			    ctx->gssmaxpacket);
-
-			if (len < 1) {
-				/* XXXrcd: ERRORS? Maybe there aren't any...? */
-				/*
-				 * XXXrcd: analyse this one a bit more,
-				 * what if we didn't get a byte because there
-				 * is a command pending?  Shouldn't happen,
-				 * but let's convince ourselves properly at
-				 * a later time...
-				 */
-				return 0;
-			}
-
-			wrap_and_put_packet(ctx, buf, len);
-			stream_drain(&ctx->raw_send, len);
-			break;
-		default:
-			return 0;
+		if (knc_get_stream_bit_type(&ctx->sushi_send)) {
+			wrap_sushi_packet(ctx);
+			continue;
 		}
+
+		rawtype = knc_get_stream_bit_type(&ctx->raw_send);
+		if (rawtype) {
+			if (knc_move_raw_to_sushi(ctx) < 0)
+				return -1;
+			continue;
+		}
+
+		if (ctx->lz4_flush_pending) {
+			if (knc_lz4_flush_send(ctx) < 0)
+				return -1;
+			continue;
+		}
+
+		return 0;
 
 	}
 
@@ -2218,6 +2745,14 @@ knc_pending(knc_ctx ctx, int dir)
 	ret  = stream_avail(knc_find_buf(ctx, KNC_SIDE_OUT, dir));
 	ret += stream_avail(knc_find_buf(ctx, KNC_SIDE_IN,  dir));
 
+	if (dir == KNC_DIR_SEND) {
+		ret += stream_avail(&ctx->sushi_send);
+		if (ctx->lz4_flush_pending)
+			ret++;
+	} else {
+		ret += stream_avail(&ctx->sushi_recv);
+	}
+
 	return ret;
 }
 
@@ -2356,7 +2891,9 @@ knc_garbage_collect(knc_ctx ctx)
 		return;
 
 	stream_garbage_collect(&ctx->raw_recv);
+	stream_garbage_collect(&ctx->sushi_recv);
 	stream_garbage_collect(&ctx->raw_send);
+	stream_garbage_collect(&ctx->sushi_send);
 	stream_garbage_collect(&ctx->cooked_recv);
 	stream_garbage_collect(&ctx->cooked_send);
 }
