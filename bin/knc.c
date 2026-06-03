@@ -269,6 +269,71 @@ xstrdup(const char *orig)
 	return s;
 }
 
+static int
+parse_size_arg(const char *prognam, const char *optname, const char *value)
+{
+	unsigned long long	ret;
+	char			*end;
+	unsigned long long	multiplier;
+
+	if (!*value) {
+		fprintf(stderr, "option \"-o %s\" requires a value\n", optname);
+		usage(prognam);
+		exit(1);
+	}
+
+	errno = 0;
+	ret = strtoull(value, &end, 10);
+	if (errno || end == value) {
+		fprintf(stderr, "option \"-o %s\" requires a size\n", optname);
+		usage(prognam);
+		exit(1);
+	}
+
+	multiplier = 1;
+	switch (*end) {
+	case '\0':
+		break;
+	case 'k':
+	case 'K':
+		multiplier = 1024;
+		end++;
+		break;
+	case 'm':
+	case 'M':
+		multiplier = 1024 * 1024;
+		end++;
+		break;
+	case 'g':
+	case 'G':
+		multiplier = 1024 * 1024 * 1024ULL;
+		end++;
+		break;
+	default:
+		fprintf(stderr, "option \"-o %s\" has invalid suffix\n",
+		    optname);
+		usage(prognam);
+		exit(1);
+	}
+
+	if (*end == 'b' || *end == 'B')
+		end++;
+	if (*end != '\0') {
+		fprintf(stderr, "option \"-o %s\" has invalid suffix\n",
+		    optname);
+		usage(prognam);
+		exit(1);
+	}
+
+	if (ret > (unsigned long long)INT_MAX / multiplier) {
+		fprintf(stderr, "option \"-o %s\" is too large\n", optname);
+		usage(prognam);
+		exit(1);
+	}
+
+	return (int)(ret * multiplier);
+}
+
 void
 parse_opt(const char *prognam, const char *opt)
 {
@@ -314,6 +379,12 @@ parse_opt(const char *prognam, const char *opt)
 
 	if (!strcmp(opt, "lz4") || !strcmp(opt, "compress-lz4")) {
 		prefs.compress_lz4 = 1;
+		return;
+	}
+
+	if (!strncmp(opt, "max-packet=", strlen("max-packet="))) {
+		opt += strlen("max-packet=");
+		prefs.max_packet = parse_size_arg(prognam, "max-packet=", opt);
 		return;
 	}
 
@@ -363,6 +434,8 @@ usage(const char *progname)
 	fprintf(stderr, "\t-N <num>\tuse fd <num> as network file "
 		"descriptor (in client mode)\n");
 	fprintf(stderr, "\t-o lz4\t\tenable LZ4 compression\n");
+	fprintf(stderr, "\t-o max-packet=<size>\n");
+	fprintf(stderr, "\t\t\tadvertise and use larger KNC packets\n");
 	fprintf(stderr, "\t-P <sprinc>\tin client mode specify Kerberos "
 		"principal for server\n");
 	fprintf(stderr, "\t-S <path>\tconnect to Unix domain socket "
@@ -982,6 +1055,10 @@ app_ctx_init(void)
 	knc_set_opt(ctx, KNC_OPT_NOPRIVACY, prefs.noprivacy);
 	knc_set_opt(ctx, KNC_OPT_NO_HALF_CLOSE, prefs.no_half_close);
 	knc_set_opt(ctx, KNC_OPT_COMPRESS_LZ4, prefs.compress_lz4);
+	if (prefs.max_packet) {
+		knc_set_opt(ctx, KNC_OPT_MAX_RECV_PACKET, prefs.max_packet);
+		knc_set_opt(ctx, KNC_OPT_MAX_SEND_PACKET, prefs.max_packet);
+	}
 	knc_set_debug(ctx, prefs.debug_level >= LOG_DEBUG);
 	knc_set_req_mech(ctx, global_mech);
 
