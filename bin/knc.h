@@ -39,6 +39,7 @@ typedef struct prefs_s {
 	int			no_half_close;
 	int			noprivacy;
 	int			compress_lz4;
+	int			max_packet;
 	int			num_children_max;
 	int			max_connections;
 	int			max_time;

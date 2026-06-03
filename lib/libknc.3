@@ -425,6 +425,13 @@ Peers that do not advertise this capability are treated as supporting
 only the legacy 64KB packet size.
 Setting this option above the legacy size enables command packets so
 that the capability can be sent.
+.It KNC_OPT_MAX_SEND_PACKET int
+sets the maximum plaintext packet size that this context will try to
+hand to
+.Fn gss_wrap .
+The actual packet size is still capped by the peer's advertised
+.Dv KNC_OPT_MAX_RECV_PACKET
+capability.
 .El
 .Pp
 These options are manipulated using the following two functions:

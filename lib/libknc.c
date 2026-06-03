@@ -1528,6 +1528,8 @@ knc_get_opt(knc_ctx ctx, unsigned opt)
 		return (int)ctx->recvinbufsiz;
 	case KNC_OPT_MAX_RECV_PACKET:
 		return (int)ctx->local_max_recv_packet;
+	case KNC_OPT_MAX_SEND_PACKET:
+		return (int)ctx->gssmaxpacket;
 
 	default:
 		break;
@@ -1573,6 +1575,11 @@ knc_set_opt(knc_ctx ctx, unsigned opt, int value)
 			ctx->opts |= KNC_OPT_SENDCMDS;
 			ctx->capabilities_sent = 0;
 		}
+		break;
+
+	case KNC_OPT_MAX_SEND_PACKET:
+		if (value > 0)
+			ctx->gssmaxpacket = value;
 		break;
 
 	default:
