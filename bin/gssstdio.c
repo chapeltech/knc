@@ -524,7 +524,11 @@ read_packet(int fd, gss_buffer_t buf, int timeout, int first)
 	static int		tmpbuf_pos = 0;
 
 	if (first) {
+		free(tmpbuf);
+		len = 0;
 		len_buf_pos = 0;
+		tmpbuf = NULL;
+		tmpbuf_pos = 0;
 		return -2;
 	}
 
@@ -611,7 +615,10 @@ read_packet(int fd, gss_buffer_t buf, int timeout, int first)
 
 bail:
 	free(tmpbuf);
+	len = 0;
+	len_buf_pos = 0;
 	tmpbuf = NULL;
+	tmpbuf_pos = 0;
 
 	return -1;
 }
