@@ -1503,10 +1503,31 @@ do_work(work_t *work, int argc, char **argv)
 
 	ret = move_data(work);
 
-	close(work->network_fd);
-	close(work->local_in);
-	close(work->local_out);
-	close(work->local_err);
+	/*
+	 * Single ownership of network_fd: close once here and disown from
+	 * the gstd token so a later gstd_close/work_free will not double
+	 * close.  Same for local fds if do_unix_socket closes again.
+	 */
+	if (work->network_fd >= 0) {
+		close(work->network_fd);
+		work->network_fd = -1;
+		if (work->context != NULL)
+			((struct gstd_tok *)work->context)->gstd_fd = -1;
+	}
+	if (work->local_in >= 0) {
+		close(work->local_in);
+		if (work->local_out == work->local_in)
+			work->local_out = -1;
+		work->local_in = -1;
+	}
+	if (work->local_out >= 0) {
+		close(work->local_out);
+		work->local_out = -1;
+	}
+	if (work->local_err >= 0) {
+		close(work->local_err);
+		work->local_err = -1;
+	}
 
 	return ret;
 }
@@ -1672,9 +1693,17 @@ do_unix_socket(work_t *work)
 
 	ret = do_work(work, 0, 0);
 
-	close(work->local_in);
-	close(work->local_out);
-	close(work->network_fd);
+	/* do_work closes and sets fds to -1; guard against double-close */
+	if (work->local_in >= 0) {
+		close(work->local_in);
+		if (work->local_out == work->local_in)
+			work->local_out = -1;
+		work->local_in = -1;
+	}
+	if (work->local_out >= 0)
+		close(work->local_out);
+	if (work->network_fd >= 0)
+		close(work->network_fd);
 
 	return ret;
 }
@@ -2036,13 +2065,36 @@ work_free(work_t *work)
 {
 
 	free(work->credentials);
+	work->credentials = NULL;
+	free(work->export_name);
+	work->export_name = NULL;
+	free(work->mech);
+	work->mech = NULL;
 
-	if (work->context != NULL)
+	if (work->context != NULL) {
+		/*
+		 * If network_fd was already closed elsewhere, the token's
+		 * gstd_fd should be -1; gstd_close will not re-close it.
+		 * Otherwise gstd_close owns the close.
+		 */
+		if (work->network_fd >= 0 &&
+		    ((struct gstd_tok *)work->context)->gstd_fd ==
+		    work->network_fd)
+			work->network_fd = -1;
 		gstd_close(work->context);
+		work->context = NULL;
+	}
+	if (work->network_fd >= 0) {
+		close(work->network_fd);
+		work->network_fd = -1;
+	}
 
 	free(work->service);
+	work->service = NULL;
 	free(work->hostname);
+	work->hostname = NULL;
 	free(work->sprinc);
+	work->sprinc = NULL;
 }
 
 int
