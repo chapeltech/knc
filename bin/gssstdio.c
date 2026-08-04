@@ -254,6 +254,29 @@ gstd_get_mech(gss_OID mech_oid)
 	return ret;
 }
 
+/*
+ * Man page promises mutual auth, integrity, and (unless noprivacy)
+ * confidentiality.
+ */
+static int
+gstd_check_ret_flags(OM_uint32 ret_flags)
+{
+	OM_uint32	need;
+
+	need = GSS_C_MUTUAL_FLAG | GSS_C_SEQUENCE_FLAG | GSS_C_INTEG_FLAG;
+	if (!prefs.noprivacy)
+		need |= GSS_C_CONF_FLAG;
+
+	if ((ret_flags & need) != need) {
+		LOG(LOG_ERR, ("GSS context missing required flags "
+			      "(got 0x%x, need 0x%x)",
+			      (unsigned)ret_flags, (unsigned)need));
+		return -1;
+	}
+
+	return 0;
+}
+
 void *
 gstd_accept(int fd, char **display_creds, char **export_name, char **mech)
 {
@@ -263,6 +286,7 @@ gstd_accept(int fd, char **display_creds, char **export_name, char **mech)
 	gss_ctx_id_t	 ctx = GSS_C_NO_CONTEXT;
 	gss_buffer_desc	 in, out;
 	OM_uint32	 maj, min;
+	OM_uint32	 ret_flags = 0;
 	int		 ret;
 
 	*display_creds = NULL;
@@ -278,8 +302,8 @@ again:
 		return NULL;
 
 	maj = gss_accept_sec_context(&min, &ctx, GSS_C_NO_CREDENTIAL,
-	    &in, GSS_C_NO_CHANNEL_BINDINGS, &client, &mech_oid, &out, NULL,
-	    NULL, NULL);
+	    &in, GSS_C_NO_CHANNEL_BINDINGS, &client, &mech_oid, &out,
+	    &ret_flags, NULL, NULL);
 
 	gss_release_buffer(&min, &in);
 
@@ -293,6 +317,12 @@ again:
 
 	if (maj & GSS_S_CONTINUE_NEEDED)
 		goto again;
+
+	if (gstd_check_ret_flags(ret_flags) < 0) {
+		gss_delete_sec_context(&min, &ctx, GSS_C_NO_BUFFER);
+		gss_release_name(&min, &client);
+		return NULL;
+	}
 
 	*display_creds = gstd_get_display_name(client);
 	*export_name = gstd_get_export_name(client);
@@ -313,6 +343,8 @@ gstd_initiate(const char *hostname, const char *service, const char *princ,
 	gss_buffer_desc	in, out;
 	gss_OID		type;
 	OM_uint32	maj, min;
+	OM_uint32	ret_flags = 0;
+	OM_uint32	req_flags;
 	gss_buffer_desc	name;
 	gss_name_t	server;
 	int		ret;
@@ -344,10 +376,14 @@ gstd_initiate(const char *hostname, const char *service, const char *princ,
 	in.length = 0;
 	out.length = 0;
 
+	req_flags = GSS_C_MUTUAL_FLAG | GSS_C_SEQUENCE_FLAG | GSS_C_INTEG_FLAG;
+	if (!prefs.noprivacy)
+		req_flags |= GSS_C_CONF_FLAG;
+
 again:
 	maj = gss_init_sec_context(&min, GSS_C_NO_CREDENTIAL, &ctx, server,
-	    global_mech, GSS_C_MUTUAL_FLAG | GSS_C_SEQUENCE_FLAG, 0,
-	    GSS_C_NO_CHANNEL_BINDINGS, &in, NULL, &out, NULL, NULL);
+	    global_mech, req_flags, 0,
+	    GSS_C_NO_CHANNEL_BINDINGS, &in, NULL, &out, &ret_flags, NULL);
 
 	if (out.length && write_packet(fd, &out))
 		return NULL;
@@ -372,6 +408,11 @@ again:
 		goto again;
 	}
 
+	if (gstd_check_ret_flags(ret_flags) < 0) {
+		gss_delete_sec_context(&min, &ctx, GSS_C_NO_BUFFER);
+		return NULL;
+	}
+
 	LOG(LOG_DEBUG, ("authenticated"));
 	SETUP_GSTD_TOK(tok, ctx, fd, "gstd_connect");
 	return tok;
@@ -389,6 +430,7 @@ gstd_read(void *the_tok, char *buf, int length)
 	OM_uint32	maj, min;
 	int		bufpos = tok->gstd_inbufpos;
 	int		ret;
+	int		conf_state;
 
 	/*
 	 * If we have no buffered data, read another packet and
@@ -407,10 +449,19 @@ gstd_read(void *the_tok, char *buf, int length)
 		if (ret <= 0)
 			return ret;
 
+		conf_state = 0;
 		maj = gss_unwrap(&min, tok->gstd_ctx, &in, &tok->gstd_inbuf,
-		    NULL, NULL);
+		    &conf_state, NULL);
 		if (maj != GSS_S_COMPLETE) {
 			gstd_error(LOG_ERR, min, "gss_unwrap");
+			return -1;
+		}
+		if (!prefs.noprivacy && !conf_state) {
+			LOG(LOG_ERR, ("gss_unwrap: confidentiality required"));
+			gss_release_buffer(&min, &tok->gstd_inbuf);
+			tok->gstd_inbuf.length = 0;
+			tok->gstd_inbuf.value = NULL;
+			gss_release_buffer(&min, &in);
 			return -1;
 		}
 		gss_release_buffer(&min, &in);

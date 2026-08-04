@@ -260,6 +260,7 @@ static size_t	read_packet(knc_ctx, stream, void **b);
 static size_t	put_packet(knc_ctx, gss_buffer_t);
 static size_t	wrap_and_put_packet(knc_ctx, char *, size_t);
 
+static int	knc_check_ret_flags(knc_ctx);
 static int	knc_state_init(knc_ctx, void *, size_t);
 static int	knc_state_accept(knc_ctx, void *, size_t);
 static int	knc_state_session(knc_ctx, void *, size_t);
@@ -984,14 +985,21 @@ wrap_and_put_packet(knc_ctx ctx, char *buf, size_t len)
 	gss_buffer_desc	 out;
 	OM_uint32	 maj;
 	OM_uint32	 min;
+	int		 conf_state = 0;
 	int		 privacy = (ctx->opts & KNC_OPT_NOPRIVACY)?0:1;
 
 	in.length = len;
 	in.value  = buf;
 	maj = gss_wrap(&min, ctx->gssctx, privacy, GSS_C_QOP_DEFAULT,
-	    &in, NULL, &out);
+	    &in, &conf_state, &out);
 
 	KNC_GSS_ERROR(ctx, maj, min, 0, "gss_wrap");
+
+	if (privacy && !conf_state) {
+		knc_proto_error(ctx, "gss_wrap did not provide confidentiality");
+		gss_release_buffer(&min, &out);
+		return 0;
+	}
 
 	return put_packet(ctx, &out);
 }
@@ -1014,7 +1022,8 @@ knc_ctx_init(void)
 	ret->cb			= GSS_C_NO_CHANNEL_BINDINGS;
 	ret->req_mech		= GSS_C_NO_OID;
 	ret->ret_mech		= GSS_C_NO_OID;
-	ret->req_flags		= GSS_C_MUTUAL_FLAG | GSS_C_SEQUENCE_FLAG;
+	ret->req_flags		= GSS_C_MUTUAL_FLAG | GSS_C_SEQUENCE_FLAG |
+				  GSS_C_INTEG_FLAG | GSS_C_CONF_FLAG;
 	ret->deleg_cred		= GSS_C_NO_CREDENTIAL;
 
 	ret->open = OPEN_READ|OPEN_WRITE;
@@ -1462,6 +1471,30 @@ knc_accept(knc_ctx ctx)
 	ctx->state  = STATE_ACCEPT;
 }
 
+/*
+ * Man page promises mutual auth, integrity, and (unless NOPRIVACY)
+ * confidentiality.  Enforce that the established context actually
+ * provides those services.
+ */
+static int
+knc_check_ret_flags(knc_ctx ctx)
+{
+	OM_uint32	need;
+
+	need = GSS_C_MUTUAL_FLAG | GSS_C_SEQUENCE_FLAG | GSS_C_INTEG_FLAG;
+	if (!(ctx->opts & KNC_OPT_NOPRIVACY))
+		need |= GSS_C_CONF_FLAG;
+
+	if ((ctx->ret_flags & need) != need) {
+		knc_proto_error(ctx, "GSS context missing required flags "
+		    "(got 0x%x, need 0x%x)", (unsigned)ctx->ret_flags,
+		    (unsigned)need);
+		return -1;
+	}
+
+	return 0;
+}
+
 static int
 knc_state_init(knc_ctx ctx, void *buf, size_t len)
 {
@@ -1488,8 +1521,11 @@ knc_state_init(knc_ctx ctx, void *buf, size_t len)
 
 	KNC_GSS_ERROR(ctx, maj, min, -1, "gss_init_sec_context");
 
-	if (!(maj & GSS_S_CONTINUE_NEEDED))
+	if (!(maj & GSS_S_CONTINUE_NEEDED)) {
+		if (knc_check_ret_flags(ctx) < 0)
+			return -1;
 		ctx->state = STATE_SESSION;
+	}
 
 	return 0;
 }
@@ -1523,8 +1559,11 @@ knc_state_accept(knc_ctx ctx, void *buf, size_t len)
 
 	KNC_GSS_ERROR(ctx, maj, min, -1, "gss_accept_sec_context");
 
-	if (!(maj & GSS_S_CONTINUE_NEEDED))
+	if (!(maj & GSS_S_CONTINUE_NEEDED)) {
+		if (knc_check_ret_flags(ctx) < 0)
+			return -1;
 		ctx->state = STATE_SESSION;
+	}
 
 	return 0;
 }
@@ -1536,6 +1575,7 @@ knc_state_session(knc_ctx ctx, void *buf, size_t len)
 	gss_buffer_desc	out;
 	OM_uint32	maj;
 	OM_uint32	min;
+	int		conf_state = 0;
 
 	in.value  = buf;
 	in.length = len;
@@ -1543,10 +1583,16 @@ knc_state_session(knc_ctx ctx, void *buf, size_t len)
 	out.length = 0;
 
 	knc_debugf(ctx, "knc_state_session: enter\n");
-	maj = gss_unwrap(&min, ctx->gssctx, &in, &out, NULL, NULL);
+	maj = gss_unwrap(&min, ctx->gssctx, &in, &out, &conf_state, NULL);
 
 	if (maj != GSS_S_COMPLETE) {
 		knc_gss_error(ctx, maj, min, "gss_unwrap");
+		return -1;
+	}
+
+	if (!(ctx->opts & KNC_OPT_NOPRIVACY) && !conf_state) {
+		knc_proto_error(ctx, "gss_unwrap: confidentiality required");
+		gss_release_buffer(&min, &out);
 		return -1;
 	}
 
@@ -1709,6 +1755,7 @@ knc_state_command(knc_ctx ctx, void *buf, size_t len)
 	char		*cmdbuf;
 	uint32_t	 cmdbuflen;
 	size_t		 remainlen;
+	int		 conf_state = 0;
 
 	in.value  = buf;
 	in.length = len;
@@ -1716,10 +1763,16 @@ knc_state_command(knc_ctx ctx, void *buf, size_t len)
 	out.length = 0;
 
 	knc_debugf(ctx, "knc_state_command: enter\n");
-	maj = gss_unwrap(&min, ctx->gssctx, &in, &out, NULL, NULL);
+	maj = gss_unwrap(&min, ctx->gssctx, &in, &out, &conf_state, NULL);
 
 	if (maj != GSS_S_COMPLETE) {
 		knc_gss_error(ctx, maj, min, "gss_unwrap");
+		return -1;
+	}
+
+	if (!(ctx->opts & KNC_OPT_NOPRIVACY) && !conf_state) {
+		knc_proto_error(ctx, "gss_unwrap: confidentiality required");
+		gss_release_buffer(&min, &out);
 		return -1;
 	}
 

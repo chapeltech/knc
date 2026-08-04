@@ -956,9 +956,21 @@ write_network_buffer(work_t *work)
 
 		LOG(LOG_DEBUG, ("plaintext of length %ld", (long)in.length));
 
-		maj = gss_wrap(&min, tok->gstd_ctx, prefs.noprivacy?0:1,
-			       GSS_C_QOP_DEFAULT, &in, NULL, &out);
-		GSTD_GSS_ERROR(maj, min, -1, "gss_wrap");
+		{
+			int	 conf_state = 0;
+			int	 privacy = prefs.noprivacy ? 0 : 1;
+
+			maj = gss_wrap(&min, tok->gstd_ctx, privacy,
+			    GSS_C_QOP_DEFAULT, &in, &conf_state, &out);
+			GSTD_GSS_ERROR(maj, min, -1, "gss_wrap");
+
+			if (privacy && !conf_state) {
+				LOG(LOG_ERR, ("gss_wrap did not provide "
+					      "confidentiality"));
+				gss_release_buffer(&min, &out);
+				return -1;
+			}
+		}
 
 		memcpy(&(work->network_buffer.out[4]), out.value, out.length);
 		packet_len = htonl(out.length);
