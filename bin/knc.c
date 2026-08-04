@@ -1458,6 +1458,16 @@ do_work(work_t *work, int argc, char **argv)
 
 	/* send the credentials to our daemon side */
 
+	/*
+	 * work->mech may be NULL if the mech OID could not be mapped.
+	 * Never strcmp a NULL mech; fail closed so we do not mis-handle
+	 * the krb5 CREDS path or send_creds(MECH, NULL).
+	 */
+	if (work->mech == NULL) {
+		LOG(LOG_ERR, ("mechanism name unavailable"));
+		return 0;
+	}
+
 	if (!(send_creds(local, work, "MECH", work->mech)		&&
 	      (strcmp(work->mech, "krb5") != 0			||
 	       send_creds(local, work, "CREDS", work->credentials))	&&
