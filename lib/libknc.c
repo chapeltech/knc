@@ -95,6 +95,14 @@ struct stream_gc {
 #define NUM_STREAM_BITS	31
 #define NUM_STREAM_BUFS	4
 
+/*
+ * Absolute maximum length of a single wire frame body (the uint32_t
+ * length prefix is not included).  Peers must not advertise larger
+ * frames; we reject them as a protocol error so raw_recv cannot grow
+ * without bound before GSS processing.
+ */
+#define KNC_MAX_WIRELEN		(1024 * 1024)
+
 struct stream {
 	struct stream_bit	*head;
 	struct stream_bit	*cur;
@@ -248,7 +256,7 @@ static size_t	stream_avail(stream);
 static void	stream_garbage_collect(stream);
 
 static int	socket_options(int, int);
-static size_t	read_packet(stream, void **b);
+static size_t	read_packet(knc_ctx, stream, void **b);
 static size_t	put_packet(knc_ctx, gss_buffer_t);
 static size_t	wrap_and_put_packet(knc_ctx, char *, size_t);
 
@@ -907,9 +915,10 @@ stream_garbage_collect(stream s)
 }
 
 static size_t
-read_packet(stream s, void **buf)
+read_packet(knc_ctx ctx, stream s, void **buf)
 {
 	size_t		 len;
+	size_t		 need;
 	uint32_t	 wirelen;
 	void		*tmp;
 
@@ -921,7 +930,20 @@ read_packet(stream s, void **buf)
 	wirelen = ntohl(*((uint32_t *)tmp));
 
 	DEBUG((NULL, "read_packet: got wirelen = %u\n", wirelen));
-	if (stream_avail(s) < (size_t)wirelen + 4)
+
+	/*
+	 * Bound wire frames so a peer cannot force unbounded raw_recv
+	 * growth.  Also reject length + 4 if it would overflow size_t.
+	 */
+	if (wirelen > KNC_MAX_WIRELEN ||
+	    (size_t)wirelen > (size_t)-1 - 4) {
+		knc_proto_error(ctx, "Wire frame too large (%u)",
+		    (unsigned)wirelen);
+		return 0;
+	}
+
+	need = (size_t)wirelen + 4;
+	if (stream_avail(s) < need)
 		return 0;
 
 	stream_drain(s, 4);
@@ -1785,7 +1807,7 @@ knc_state_process_in(knc_ctx ctx)
 	 */
 
 	for (;;) {
-		len = read_packet(&ctx->raw_recv, &buf);
+		len = read_packet(ctx, &ctx->raw_recv, &buf);
 
 		knc_debugf(ctx, "read_packet returned %zd\n", len);
 
