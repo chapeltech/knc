@@ -972,6 +972,13 @@ write_network_buffer(work_t *work)
 			}
 		}
 
+		if (out.length > sizeof(work->network_buffer.out) - 4) {
+			LOG(LOG_ERR, ("gss_wrap output too large (%ld)",
+				      (long)out.length));
+			gss_release_buffer(&min, &out);
+			return -1;
+		}
+
 		memcpy(&(work->network_buffer.out[4]), out.value, out.length);
 		packet_len = htonl(out.length);
 		memcpy(&(work->network_buffer.out[0]), &packet_len, 4);
