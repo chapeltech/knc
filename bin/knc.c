@@ -1838,18 +1838,14 @@ do_listener(int listener, int argc, char **argv)
 			/* Connecting to a unix domain socket */
 			if (prefs.no_fork)
 				do_unix_socket(work);
-			else {
-				fork_and_do_unix_socket(work, listener);
+			else if (fork_and_do_unix_socket(work, listener))
 				++num_children;
-			}
 		} else {
 			/* execing a program */
 			if (prefs.no_fork)
 				do_work(work, argc, argv);
-			else {
-				fork_and_do_work(work, listener, argc, argv);
+			else if (fork_and_do_work(work, listener, argc, argv))
 				++num_children;
-			}
 		}
 
 		/* And now, as the parent, we no longer need this work
