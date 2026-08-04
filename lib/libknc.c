@@ -1807,9 +1807,15 @@ knc_state_process_in(knc_ctx ctx)
 	 */
 
 	for (;;) {
+		if (ctx->error)
+			return -1;
+
 		len = read_packet(ctx, &ctx->raw_recv, &buf);
 
 		knc_debugf(ctx, "read_packet returned %zd\n", len);
+
+		if (ctx->error)
+			return -1;
 
 		if (len < 1)	/* XXXrcd: How about 0? */
 			return 0;
@@ -1832,7 +1838,8 @@ knc_state_process_in(knc_ctx ctx)
 			break;
 		}
 
-		/* XXXrcd: errors and the like? */
+		if (ret < 0 || ctx->error)
+			return -1;
 
 		/* XXXrcd: EOF handling likely wants to go here. */
 
@@ -2775,6 +2782,9 @@ knc_fill(knc_ctx ctx, int dir)
 		knc_state_process_in(ctx);
 
 	knc_garbage_collect(ctx);
+
+	if (ctx->error)
+		return EIO;
 
 	return 0;
 }
