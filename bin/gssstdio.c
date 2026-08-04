@@ -646,7 +646,7 @@ writen(int fd, const void *buf, ssize_t len) {
 
 	nleft = len;
 	while (nleft > 0) {
-		nwritten = write(fd, buffer, len);
+		nwritten = write(fd, buffer, nleft);
 
 		if (nwritten < 0) {
 			if (errno == EINTR || errno == EAGAIN)
