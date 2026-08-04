@@ -860,7 +860,15 @@ write_local_buffer(work_t *work)
 		    &(work->local_buffer.out[work->local_buffer.out_pos]),
 		    work->local_buffer.out_len);
 
-	if (len < 0 && ((errno != EINTR) && (errno != EAGAIN))) {
+	if (len < 0) {
+		if (errno == EINTR || errno == EAGAIN) {
+			/*
+			 * Non-blocking socket not ready.  Leave the buffer
+			 * unchanged and return positive so move_data does
+			 * not treat this as EPIPE (which is return 0).
+			 */
+			return 1;
+		}
 		if (errno == EPIPE) {
 			/*
 			 * It's possible that exec'd programs (or the
@@ -881,13 +889,15 @@ write_local_buffer(work_t *work)
 
 			work->local_buffer.out_valid = 0;
 			return 0;
-		} else {
-			LOG_ERRNO(LOG_ERR, ("write_local_buffer, "
-					    "write failed"));
-			return -1;
 		}
+		LOG_ERRNO(LOG_ERR, ("write_local_buffer, "
+				    "write failed"));
+		return -1;
 	}
 
+	/* Only advance on successful write of one or more bytes */
+	if (len == 0)
+		return 1;
 
 	work->local_buffer.out_len -= len;
 	LOG(LOG_DEBUG, ("transmitted %d bytes, %d remaining", len,
@@ -969,7 +979,15 @@ write_network_buffer(work_t *work)
 		    &(work->network_buffer.out[work->network_buffer.out_pos]),
 		    work->network_buffer.out_len);
 
-	if (len < 0 && ((errno != EINTR) && (errno != EAGAIN))) {
+	if (len < 0) {
+		if (errno == EINTR || errno == EAGAIN) {
+			/*
+			 * Non-blocking socket not ready.  Leave the buffer
+			 * unchanged and return positive so move_data does
+			 * not treat this as EPIPE (which is return 0).
+			 */
+			return 1;
+		}
 		if (errno == EPIPE) {
 			/*
 			 * It's possible that exec'd programs (or the
@@ -990,14 +1008,15 @@ write_network_buffer(work_t *work)
 
 			work->network_buffer.out_valid = 0;
 			return 0;
-		} else {
-			LOG_ERRNO(LOG_ERR, ("write_network_buffer, "
-					    "write failed"));
-			return -1;
 		}
+		LOG_ERRNO(LOG_ERR, ("write_network_buffer, "
+				    "write failed"));
+		return -1;
 	}
 
-
+	/* Only advance on successful write of one or more bytes */
+	if (len == 0)
+		return 1;
 
 	work->network_buffer.out_len -= len;
 	LOG(LOG_DEBUG, ("transmitted %d bytes, %d remaining", len,
