@@ -1,3 +1,10 @@
+knc (1.12-2) unstable; urgency=low
+
+  * Build against the distro-provided heimdal-dev package.
+  * Build release packages natively for amd64 and arm64.
+
+ -- Roland C. Dowdeswell <elric@imrryr.org>  Wed, 05 Aug 2026 20:42:07 +0100
+
 knc (1.12-1) unstable; urgency=low
 
   * do a bit more logging by default...
