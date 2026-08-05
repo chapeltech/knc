@@ -2,7 +2,7 @@ Source: knc
 Section: unknown
 Priority: extra
 Maintainer: elric <elric@imrryr.org>
-Build-Depends: debhelper (>= 7), dh-autoreconf, krb5-multidev | heimdal-multidev, pkg-config
+Build-Depends: debhelper (>= 7), dh-autoreconf, heimdal (>= 7.99.1), pkg-config
 Standards-Version: 3.8.3
 Homepage: https://github.com/ChapelTech/knc
 X-Python-Version: 2.7
@@ -28,7 +28,7 @@ Description: Kerberised Netcat library
 
 Package: libknc-dev
 Architecture: any
-Depends: ${shlibs:Depends}, ${misc:Depends}, libknc (= ${binary:Version}), krb5-multidev | heimdal-multidev
+Depends: ${shlibs:Depends}, ${misc:Depends}, libknc (= ${binary:Version}), heimdal (>= 7.99.1)
 Description: Kerberised NetCat
      The KNC protocol provides an 8-bit clean, mutually authenticated
      Kerberised tunnel between two endpoints.

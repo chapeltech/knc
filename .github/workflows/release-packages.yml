@@ -7,20 +7,35 @@ on:
 permissions:
   contents: read
 
+env:
+  HEIMDAL_REPOSITORY: ChapelTech/heimdal
+  HEIMDAL_RELEASE: v7.99.1
+
 jobs:
   debian:
     runs-on: ubuntu-latest
-    container: debian:bookworm
+    container: debian:trixie-slim
     steps:
       - name: Install dependencies
         run: |
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y \
             autoconf automake build-essential ca-certificates debhelper \
-            dh-autoreconf dpkg-dev git heimdal-multidev libtool pkg-config
+            curl dh-autoreconf dpkg-dev git jq libtool pkg-config
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.release.tag_name }}
+      - name: Install matching Heimdal package
+        run: |
+          arch=$(dpkg --print-architecture)
+          api="https://api.github.com/repos/$HEIMDAL_REPOSITORY/releases/tags/$HEIMDAL_RELEASE"
+          urls=$(curl -fsSL -H 'Accept: application/vnd.github+json' "$api" |
+            jq -r '.assets[].browser_download_url' |
+            grep -E "/heimdal_[^/]+_${arch}\\.deb$")
+          test "$(printf '%s\n' "$urls" | grep -c .)" -eq 1
+          curl -fsSL "$urls" -o heimdal.deb
+          test "$(dpkg-deb -f heimdal.deb Architecture)" = "$arch"
+          apt-get install -y ./heimdal.deb
       - name: Check release version
         env:
           RELEASE_TAG: ${{ github.event.release.tag_name }}
