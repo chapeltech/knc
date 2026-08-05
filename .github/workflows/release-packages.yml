@@ -62,6 +62,7 @@ jobs:
           test "$version" = "$(rpm --specfile -q --qf '%{VERSION}\n' packaging/rpm/knc.spec | head -1)"
       - name: Build RPM packages
         run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           version=$(sed -n 's/^AC_INIT(\[knc\], \[\([^]]*\)\].*/\1/p' configure.ac)
           mkdir -p "$HOME/rpmbuild/SOURCES"
           git archive --prefix="knc-$version/" HEAD |
