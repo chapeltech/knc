@@ -1,0 +1,96 @@
+name: Release packages
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  debian:
+    runs-on: ubuntu-latest
+    container: debian:bookworm
+    steps:
+      - name: Install dependencies
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            autoconf automake build-essential ca-certificates debhelper \
+            dh-autoreconf dpkg-dev git heimdal-multidev libtool pkg-config
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+      - name: Check release version
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          version=$(sed -n 's/^AC_INIT(\[knc\], \[\([^]]*\)\].*/\1/p' configure.ac)
+          test "${RELEASE_TAG#v}" = "$version"
+          test "${RELEASE_TAG#v}" = "$(dpkg-parsechangelog -SVersion | sed 's/-[^-]*$//')"
+      - name: Build Debian packages
+        run: |
+          DEB_BUILD_OPTIONS="parallel=$(nproc)" \
+            dpkg-buildpackage --build=binary --no-sign
+          mkdir artifacts
+          cp ../*.deb artifacts/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: debian-packages
+          path: artifacts/*.deb
+          if-no-files-found: error
+          retention-days: 1
+
+  rpm:
+    runs-on: ubuntu-latest
+    container: rockylinux:9
+    steps:
+      - name: Install dependencies
+        run: >-
+          dnf install -y
+          autoconf automake file findutils gcc git gzip krb5-devel libtool
+          make rpm-build sed tar
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+      - name: Check release version
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          version=$(sed -n 's/^AC_INIT(\[knc\], \[\([^]]*\)\].*/\1/p' configure.ac)
+          test "${RELEASE_TAG#v}" = "$version"
+          test "$version" = "$(rpm --specfile -q --qf '%{VERSION}\n' packaging/rpm/knc.spec | head -1)"
+      - name: Build RPM packages
+        run: |
+          version=$(sed -n 's/^AC_INIT(\[knc\], \[\([^]]*\)\].*/\1/p' configure.ac)
+          mkdir -p "$HOME/rpmbuild/SOURCES"
+          git archive --prefix="knc-$version/" HEAD |
+            gzip -n > "$HOME/rpmbuild/SOURCES/knc-$version.tar.gz"
+          rpmbuild -ba packaging/rpm/knc.spec
+          mkdir artifacts
+          cp "$HOME"/rpmbuild/RPMS/*/*.rpm artifacts/
+          cp "$HOME"/rpmbuild/SRPMS/*.src.rpm artifacts/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rpm-packages
+          path: artifacts/*rpm
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: [debian, rpm]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Upload packages to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: >-
+          gh release upload "$RELEASE_TAG" artifacts/* --clobber
+          --repo "$GITHUB_REPOSITORY"

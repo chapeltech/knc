@@ -3,7 +3,7 @@ Version:        1.12
 Release:        2%{?dist}
 Summary:        Kerberised NetCat
 License:        MIT
-URL:            https://github.com/elric1/knc
+URL:            https://github.com/ChapelTech/knc
 Source0:        knc-%{version}.tar.gz
 
 BuildRequires:  autoconf
@@ -12,7 +12,6 @@ BuildRequires:  gcc
 BuildRequires:  krb5-devel
 BuildRequires:  libtool
 BuildRequires:  make
-BuildRequires:  patchelf
 
 Requires:       krb5-libs
 Requires:       libknc%{?_isa} = %{version}-%{release}
@@ -47,11 +46,6 @@ autoreconf -fi
 %make_install
 find %{buildroot} -name '*.la' -delete
 find %{buildroot} -name '*.a' -delete
-find %{buildroot} -type f -print0 | while IFS= read -r -d '' file; do
-    if file "$file" | grep -q 'ELF'; then
-        patchelf --remove-rpath "$file" 2>/dev/null || true
-    fi
-done
 
 %post -n libknc -p /sbin/ldconfig
 %postun -n libknc -p /sbin/ldconfig

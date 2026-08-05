@@ -2,9 +2,9 @@ Source: knc
 Section: unknown
 Priority: extra
 Maintainer: elric <elric@imrryr.org>
-Build-Depends: debhelper (>= 7), dh-autoreconf, krb5-multidev | heimdal-multidev
+Build-Depends: debhelper (>= 7), dh-autoreconf, krb5-multidev | heimdal-multidev, pkg-config
 Standards-Version: 3.8.3
-Homepage: http://oskt.secure-endpoints.com/knc
+Homepage: https://github.com/ChapelTech/knc
 X-Python-Version: 2.7
 
 Package: knc

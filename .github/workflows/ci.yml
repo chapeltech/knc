@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  heimdal:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            autoconf automake build-essential heimdal-multidev \
+            libtool pkg-config
+      - name: Build with Heimdal
+        run: |
+          autoreconf -fi
+          ./configure --with-krb5-config=/usr/bin/krb5-config.heimdal
+          make -j"$(nproc)"
+      - name: Run unit test
+        run: make check
+      - name: Smoke-test executable
+        run: |
+          if bin/knc -? >knc-usage 2>&1; then
+            exit 1
+          else
+            test "$?" -eq 1
+          fi
+          grep -q '^usage:' knc-usage
+
+  mit:
+    runs-on: ubuntu-latest
+    container: rockylinux:9
+    steps:
+      - name: Install dependencies
+        run: >-
+          dnf install -y
+          autoconf automake diffutils file gcc git krb5-devel libtool make
+          pkgconf-pkg-config
+      - uses: actions/checkout@v4
+      - name: Build with MIT Kerberos
+        run: |
+          autoreconf -fi
+          ./configure --with-gss-dir=/usr
+          make -j"$(nproc)"
+      - name: Run unit test
+        run: make check
+      - name: Smoke-test executable
+        run: |
+          if bin/knc -? >knc-usage 2>&1; then
+            exit 1
+          else
+            test "$?" -eq 1
+          fi
+          grep -q '^usage:' knc-usage
+      - name: Check MIT GSSAPI linkage
+        run: ldd bin/knc | grep -q 'libgssapi_krb5\.so'
