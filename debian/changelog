@@ -1,3 +1,9 @@
+knc (1.13-1) unstable; urgency=low
+
+  * Release 1.13.
+
+ -- Roland C. Dowdeswell <elric@imrryr.org>  Thu, 06 Aug 2026 15:29:38 +0100
+
 knc (1.12-2) unstable; urgency=low
 
   * Build against the distro-provided heimdal-dev package.

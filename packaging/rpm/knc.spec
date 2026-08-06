@@ -1,6 +1,6 @@
 Name:           knc
-Version:        1.12
-Release:        3%{?dist}
+Version:        1.13
+Release:        1%{?dist}
 Summary:        Kerberised NetCat
 License:        MIT
 URL:            https://github.com/ChapelTech/knc
@@ -66,6 +66,9 @@ find %{buildroot} -name '*.a' -delete
 %{_mandir}/man3/libknc.3*
 
 %changelog
+* Thu Aug 06 2026 ChapelTech <packages@chapel.tech> - 1.13-1
+- Release 1.13.
+
 * Wed Aug 05 2026 ChapelTech <packages@chapel.tech> - 1.12-3
 - Embed OpenPGP signatures in release RPMs.
 

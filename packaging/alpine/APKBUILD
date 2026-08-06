@@ -1,6 +1,6 @@
 # Maintainer: ChapelTech <packages@chapel.tech>
 pkgname=knc
-pkgver=1.12
+pkgver=1.13
 pkgrel=0
 pkgdesc="Kerberos-authenticated NetCat implementation"
 url="https://github.com/ChapelTech/knc"
@@ -58,5 +58,5 @@ libknc_dev() {
 }
 
 sha512sums="
-SKIP  knc-1.12.tar.gz
+SKIP  knc-1.13.tar.gz
 "
