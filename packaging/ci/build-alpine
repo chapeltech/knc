@@ -1,0 +1,91 @@
+#!/bin/sh
+
+set -eu
+
+: "${RELEASE_TAG:?RELEASE_TAG is required}"
+: "${TARGET_ARCHITECTURE:?TARGET_ARCHITECTURE is required}"
+: "${SOURCE_DIR:?SOURCE_DIR is required}"
+: "${PACKAGING_DIR:?PACKAGING_DIR is required}"
+: "${ARTIFACT_DIR:?ARTIFACT_DIR is required}"
+
+apk add --no-cache \
+    alpine-sdk atools-apkbuild-lint autoconf automake heimdal-dev libtool
+
+case "$TARGET_ARCHITECTURE" in
+    x86_64|aarch64) ;;
+    *)
+        echo "unsupported target architecture: $TARGET_ARCHITECTURE" >&2
+        exit 1
+        ;;
+esac
+
+# shellcheck disable=SC1091 # Alpine base image contract.
+. /etc/os-release
+case "$VERSION_ID" in
+    3.24|3.24.*) ;;
+    *)
+        echo "Alpine 3.24 is required, found $VERSION_ID" >&2
+        exit 1
+        ;;
+esac
+test "$(apk --print-arch)" = "$TARGET_ARCHITECTURE"
+test "$(uname -m)" = "$TARGET_ARCHITECTURE"
+
+test -f "$SOURCE_DIR/configure.ac"
+apkbuild="$PACKAGING_DIR/packaging/alpine/APKBUILD"
+test -f "$apkbuild"
+
+version=$(sed -n 's/^AC_INIT(\[knc\], \[\([^]]*\)\].*/\1/p' \
+    "$SOURCE_DIR/configure.ac")
+package_version=$(sed -n 's/^pkgver=\([^[:space:]]*\).*/\1/p' "$apkbuild")
+test -n "$version"
+test "${RELEASE_TAG#v}" = "$version"
+test "$package_version" = "$version"
+
+apkbuild-lint "$apkbuild"
+
+build_root=/root/knc
+repository=/root/packages
+distfile=$build_root/knc-$version.tar.gz
+
+install -d "$build_root" "$repository"
+cp "$apkbuild" "$build_root/APKBUILD"
+
+git config --global --add safe.directory "$SOURCE_DIR"
+git -C "$SOURCE_DIR" archive --prefix="knc-$version/" HEAD |
+    gzip -n >"$distfile"
+chmod 644 "$distfile"
+
+if test -n "${PACKAGER_PRIVKEY:-}"; then
+    test -f "$PACKAGER_PRIVKEY"
+    test -r "$PACKAGER_PRIVKEY"
+else
+    abuild-keygen -a -n
+    PACKAGER_PRIVKEY=$(sed -n \
+        's/^PACKAGER_PRIVKEY="\([^"]*\)"/\1/p' \
+        /root/.abuild/abuild.conf)
+    test -n "$PACKAGER_PRIVKEY"
+    cp "$PACKAGER_PRIVKEY.pub" /etc/apk/keys/
+fi
+export PACKAGER_PRIVKEY
+
+abuild -F -C "$build_root" checksum
+abuild -F -C "$build_root" validate
+apkbuild-lint "$build_root/APKBUILD"
+abuild -F -C "$build_root" -P "$repository" -r
+
+mkdir -p "$ARTIFACT_DIR"
+packages=$(find "$repository" -type f -name '*.apk')
+test -n "$packages"
+for package in $packages; do
+    package_arch=$(tar -xOzf "$package" .PKGINFO |
+        sed -n 's/^arch = //p')
+    case "$package_arch" in
+        "$TARGET_ARCHITECTURE"|noarch) ;;
+        *)
+            echo "unexpected package architecture: $package_arch" >&2
+            exit 1
+            ;;
+    esac
+    cp "$package" "$ARTIFACT_DIR/"
+done

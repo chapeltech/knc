@@ -1,0 +1,62 @@
+# Maintainer: ChapelTech <packages@chapel.tech>
+pkgname=knc
+pkgver=1.12
+pkgrel=0
+pkgdesc="Kerberos-authenticated NetCat implementation"
+url="https://github.com/ChapelTech/knc"
+arch="all"
+license="MIT"
+depends="heimdal-libs libknc=$pkgver-r$pkgrel"
+makedepends="autoconf automake heimdal-dev libtool"
+subpackages="$pkgname-doc libknc:libknc libknc-dev:libknc_dev"
+source="$pkgname-$pkgver.tar.gz"
+
+prepare() {
+	default_prepare
+	autoreconf -fi
+}
+
+build() {
+	CPPFLAGS="$CPPFLAGS -DNETDB_INTERNAL=-1" \
+		./configure \
+			--build="$CBUILD" \
+			--host="$CHOST" \
+			--prefix=/usr \
+			--sysconfdir=/etc \
+			--localstatedir=/var \
+			--with-gss-dir=/usr \
+			--disable-static
+	make
+}
+
+check() {
+	make check
+}
+
+package() {
+	make DESTDIR="$pkgdir" install
+	find "$pkgdir" -name '*.la' -delete
+	rm "$pkgdir"/usr/bin/servefile \
+		"$pkgdir"/usr/bin/testknc \
+		"$pkgdir"/usr/bin/unit \
+		"$pkgdir"/usr/bin/unit-simple
+}
+
+libknc() {
+	pkgdesc="Runtime library for knc"
+	depends="heimdal-libs"
+
+	amove usr/lib/libknc.so.0*
+}
+
+libknc_dev() {
+	pkgdesc="Development files for libknc"
+	depends="heimdal-dev"
+
+	amove usr/include/libknc.h
+	amove usr/lib/libknc.so
+}
+
+sha512sums="
+SKIP  knc-1.12.tar.gz
+"
