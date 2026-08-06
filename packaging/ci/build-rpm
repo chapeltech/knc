@@ -1,0 +1,42 @@
+#!/bin/sh
+
+set -eu
+
+: "${RELEASE_TAG:?RELEASE_TAG is required}"
+: "${TARGET_ARCHITECTURE:?TARGET_ARCHITECTURE is required}"
+: "${SOURCE_DIR:?SOURCE_DIR is required}"
+: "${PACKAGING_DIR:?PACKAGING_DIR is required}"
+: "${ARTIFACT_DIR:?ARTIFACT_DIR is required}"
+
+dnf install -y \
+    autoconf automake file findutils gcc git gzip krb5-devel libtool make \
+    rpm-build sed tar
+
+test -f "$SOURCE_DIR/configure.ac"
+spec=$PACKAGING_DIR/packaging/rpm/knc.spec
+test -f "$spec"
+
+version=$(sed -n 's/^AC_INIT(\[knc\], \[\([^]]*\)\].*/\1/p' \
+    "$SOURCE_DIR/configure.ac")
+test "${RELEASE_TAG#v}" = "$version"
+test "$version" = "$(rpm --specfile -q --qf '%{VERSION}\n' "$spec" | head -1)"
+
+. /etc/os-release
+test "${VERSION_ID%%.*}" = 9
+test "$(uname -m)" = "$TARGET_ARCHITECTURE"
+
+git config --global --add safe.directory "$SOURCE_DIR"
+mkdir -p "$HOME/rpmbuild/SOURCES"
+git -C "$SOURCE_DIR" archive --prefix="knc-$version/" HEAD |
+    gzip -n >"$HOME/rpmbuild/SOURCES/knc-$version.tar.gz"
+rpmbuild -ba "$spec"
+
+mkdir -p "$ARTIFACT_DIR"
+cp "$HOME"/rpmbuild/RPMS/*/*.rpm "$ARTIFACT_DIR/"
+cp "$HOME"/rpmbuild/SRPMS/*.src.rpm "$ARTIFACT_DIR/"
+for package in "$ARTIFACT_DIR"/*.rpm; do
+    case "$package" in
+        *.src.rpm) ;;
+        *) test "$(rpm -qp --qf '%{ARCH}' "$package")" = "$TARGET_ARCHITECTURE" ;;
+    esac
+done

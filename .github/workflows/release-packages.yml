@@ -1,3 +1,4 @@
+---
 name: Release packages
 
 on:
@@ -11,156 +12,12 @@ on:
         type: string
 
 permissions:
-  contents: read
-
-env:
-  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.event.release.tag_name }}
-
-concurrency:
-  group: release-packages-${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.event.release.tag_name }}
-  cancel-in-progress: false
+  contents: write
 
 jobs:
-  release:
-    name: Validate release
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check selected release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null
-
-  debian:
-    needs: release
-    strategy:
-      matrix:
-        include:
-          - architecture: amd64
-            runner: ubuntu-24.04
-          - architecture: arm64
-            runner: ubuntu-24.04-arm
-    runs-on: ${{ matrix.runner }}
-    container: debian:trixie-slim
-    steps:
-      - name: Install dependencies
-        run: |
-          apt-get update
-          DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            autoconf automake build-essential ca-certificates debhelper \
-            dh-autoreconf dpkg-dev git heimdal-dev libtool pkg-config
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.workflow_sha }}
-          path: workflow
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ env.RELEASE_TAG }}
-          path: source
-      - name: Check release version
-        run: |
-          cp workflow/debian/control source/debian/control
-          cp workflow/debian/changelog source/debian/changelog
-          cd source
-          version=$(sed -n 's/^AC_INIT(\[knc\], \[\([^]]*\)\].*/\1/p' configure.ac)
-          test "${RELEASE_TAG#v}" = "$version"
-          test "${RELEASE_TAG#v}" = "$(dpkg-parsechangelog -SVersion | sed 's/-[^-]*$//')"
-          dpkg-checkbuilddeps
-      - name: Build Debian packages
-        run: |
-          cd source
-          test "$(dpkg --print-architecture)" = "${{ matrix.architecture }}"
-          DEB_BUILD_OPTIONS="parallel=$(nproc)" \
-            dpkg-buildpackage --build=binary --no-sign
-          mkdir artifacts
-          cp ../*.deb artifacts/
-      - uses: actions/upload-artifact@v4
-        with:
-          name: debian-packages-${{ matrix.architecture }}
-          path: source/artifacts/*.deb
-          if-no-files-found: error
-          retention-days: 1
-
-  rpm:
-    needs: release
-    runs-on: ubuntu-24.04
-    container: rockylinux:9
-    steps:
-      - name: Install dependencies
-        run: >-
-          dnf install -y
-          autoconf automake file findutils gcc git gnupg2 gzip krb5-devel
-          libtool make rpm-build rpm-sign sed tar
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.workflow_sha }}
-          path: workflow
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ env.RELEASE_TAG }}
-          path: source
-      - name: Check release version
-        run: |
-          cp workflow/packaging/rpm/knc.spec source/packaging/rpm/knc.spec
-          cd source
-          version=$(sed -n 's/^AC_INIT(\[knc\], \[\([^]]*\)\].*/\1/p' configure.ac)
-          test "${RELEASE_TAG#v}" = "$version"
-          test "$version" = "$(rpm --specfile -q --qf '%{VERSION}\n' packaging/rpm/knc.spec | head -1)"
-      - name: Build RPM packages
-        run: |
-          cd source
-          . /etc/os-release
-          test "${VERSION_ID%%.*}" = 9
-          test "$(uname -m)" = x86_64
-          git config --global --add safe.directory "$GITHUB_WORKSPACE/source"
-          version=$(sed -n 's/^AC_INIT(\[knc\], \[\([^]]*\)\].*/\1/p' configure.ac)
-          mkdir -p "$HOME/rpmbuild/SOURCES"
-          git archive --prefix="knc-$version/" HEAD |
-            gzip -n > "$HOME/rpmbuild/SOURCES/knc-$version.tar.gz"
-          rpmbuild -ba packaging/rpm/knc.spec
-          mkdir artifacts
-          cp "$HOME"/rpmbuild/RPMS/*/*.rpm artifacts/
-          cp "$HOME"/rpmbuild/SRPMS/*.src.rpm artifacts/
-          for package in artifacts/*.rpm; do
-            case "$package" in
-              *.src.rpm) ;;
-              *) test "$(rpm -qp --qf '%{ARCH}' "$package")" = x86_64 ;;
-            esac
-          done
-      - name: Sign RPM packages
-        env:
-          RPM_SIGNING_KEY: ${{ secrets.ARCHIVE_SIGNING_KEY }}
-          RPM_SIGNING_FINGERPRINT: ${{ vars.ARCHIVE_SIGNING_FINGERPRINT }}
-          RPM_SIGNING_PASSPHRASE: ${{ secrets.ARCHIVE_SIGNING_PASSPHRASE }}
-        working-directory: source
-        run: ../workflow/.github/scripts/sign-rpms artifacts/*.rpm
-      - uses: actions/upload-artifact@v4
-        with:
-          name: rpm-packages
-          path: source/artifacts/*rpm
-          if-no-files-found: error
-          retention-days: 1
-
-  publish:
-    needs: [debian, rpm]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-          merge-multiple: true
-      - name: Upload packages to release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: >-
-          gh release upload "$RELEASE_TAG" artifacts/*
-          --repo "$GITHUB_REPOSITORY" --clobber
-      - name: Notify package repository
-        env:
-          GH_TOKEN: ${{ secrets.PKGS_DISPATCH_TOKEN }}
-        run: >-
-          gh api --method POST repos/ChapelTech/pkgs/dispatches
-          -f event_type=package-release
-          -f "client_payload[repository]=$GITHUB_REPOSITORY"
-          -f "client_payload[tag]=$RELEASE_TAG"
+  release-packages:
+    uses: ChapelTech/pkgs/.github/workflows/release-packages.yml@master
+    with:
+      release_tag: ${{ github.event.release.tag_name || inputs.release_tag }}
+      packaging_ref: ${{ github.workflow_sha }}
+    secrets: inherit
