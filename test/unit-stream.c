@@ -78,11 +78,39 @@ test_input_reuses_only_reachable_tail_space(void)
 	knc_ctx_destroy(ctx);
 }
 
+static void
+test_fill_reports_state_handler_failure(void)
+{
+	uint32_t	wirelen;
+	unsigned char	frame[5];
+	knc_ctx		ctx;
+	int		fds[2];
+
+	check(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0,
+	    "socketpair failed");
+	wirelen = htonl(1);
+	memcpy(frame, &wirelen, sizeof(wirelen));
+	frame[4] = 0;
+	check(write(fds[1], frame, sizeof(frame)) == (ssize_t)sizeof(frame),
+	    "frame write failed");
+
+	ctx = knc_ctx_init();
+	check(ctx != NULL, "knc_ctx_init failed");
+	knc_set_net_fd(ctx, fds[0]);
+	check(knc_fill(ctx, KNC_DIR_RECV) == EIO,
+	    "knc_fill ignored a state handler failure");
+
+	knc_ctx_destroy(ctx);
+	close(fds[0]);
+	close(fds[1]);
+}
+
 int
 main(void)
 {
 
 	test_input_reuses_only_reachable_tail_space();
+	test_fill_reports_state_handler_failure();
 
 	return 0;
 }

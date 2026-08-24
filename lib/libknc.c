@@ -2831,8 +2831,10 @@ knc_fill(knc_ctx ctx, int dir)
 		knc_fill_buf(ctx, dir, (size_t)ret);
 	}
 
-	if (dir == KNC_DIR_RECV)
-		knc_state_process_in(ctx);
+	if (dir == KNC_DIR_RECV && knc_state_process_in(ctx) < 0) {
+		knc_garbage_collect(ctx);
+		return EIO;
+	}
 
 	knc_garbage_collect(ctx);
 
