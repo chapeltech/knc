@@ -1,0 +1,17 @@
+# KNC rsync socket activation
+
+These units run KNC as an inetd-style wait service on the rsync port.  They
+expect an executable `/usr/local/libexec/rsync-service` and an rsync daemon
+configuration selected by that helper.
+
+Install both units in `/etc/systemd/system`, then run:
+
+```
+systemctl daemon-reload
+systemctl enable --now knc-rsync.socket
+```
+
+The service deliberately retains the capabilities commonly needed by a root
+rsync daemon to change ownership, switch users, preserve file metadata and
+use a module chroot.  Remove capabilities and add `ReadWritePaths=` entries
+when the deployed rsync modules permit tighter restrictions.

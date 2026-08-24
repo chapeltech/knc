@@ -1,0 +1,39 @@
+[Unit]
+Description=KNC-protected rsync service
+Documentation=man:knc(1) man:systemd.service(5)
+Requires=knc-rsync.socket
+After=knc-rsync.socket
+
+[Service]
+ExecStart=@/usr/bin/knc knc -iw -o handshake-timeout=30 /usr/local/libexec/rsync-service
+StandardInput=socket
+StandardOutput=journal
+StandardError=journal
+Restart=on-failure
+RestartSec=1s
+
+NoNewPrivileges=true
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH
+CapabilityBoundingSet=CAP_FOWNER CAP_FSETID CAP_MKNOD CAP_SETFCAP
+CapabilityBoundingSet=CAP_SETGID CAP_SETUID CAP_SYS_CHROOT
+LockPersonality=true
+MemoryDenyWriteExecute=true
+PrivateTmp=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectProc=invisible
+ProtectSystem=full
+RemoveIPC=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+SystemCallFilter=~@clock @cpu-emulation @debug @module @mount @obsolete @raw-io @reboot @swap
+SystemCallErrorNumber=EPERM
+TasksMax=300
+UMask=0077

@@ -1,0 +1,12 @@
+[Unit]
+Description=KNC-protected rsync socket
+Documentation=man:systemd.socket(5)
+
+[Socket]
+ListenStream=873
+Accept=no
+Backlog=128
+NoDelay=true
+
+[Install]
+WantedBy=sockets.target
