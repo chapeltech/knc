@@ -76,7 +76,7 @@ int	fork_and_do_unix_socket(work_t *, int);
 int	do_client(int, char **);
 int	send_creds(int, work_t *, const char *const, const char * const);
 int	emit_key_value(work_t *, const char * const, const char * const);
-int	putenv_knc_key_value(const char * const, const char * const);
+int	setenv_knc_key_value(const char * const, const char * const);
 int	do_work(work_t *, int, char **);
 int	fork_and_do_work(work_t *, int, int, char **);
 int	move_local_to_network_buffer(work_t *);
@@ -1338,16 +1338,15 @@ send_creds(int local, work_t *work, const char *const key,
 	   const char *const value)
 {
 
-	if (local && !value)
-		return writen(work->local_out, "END\n", 4) < 0 ? 0 : 1;
-
-	if (!value)
-		return 1;
-
-	if (local)
+	if (local) {
+		if (!strcmp(key, "END"))
+			return writen(work->local_out, "END\n", 4) < 0 ? 0 : 1;
+		if (!value)
+			return 1;
 		return emit_key_value(work, key, value);
+	}
 
-	return putenv_knc_key_value(key, value);
+	return setenv_knc_key_value(key, value);
 }
 
 int
@@ -1388,18 +1387,27 @@ emit_key_value(work_t * work, const char * const key,
 }
 
 int
-putenv_knc_key_value(const char * const key, const char * const value)
+setenv_knc_key_value(const char * const key, const char * const value)
 {
-	char	*p;
+	char	*name;
+	int	 ret;
 
-	if ((p = malloc(strlen(key) + 1 + strlen(value) + 5)) == NULL) {
-		LOG(LOG_ERR, ("malloc failure during putenv_knc_key_value"));
+	if ((name = malloc(strlen(key) + sizeof("KNC_"))) == NULL) {
+		LOG(LOG_ERR, ("malloc failure during setenv_knc_key_value"));
 		return 0;
 	}
 
-	/* safe */
-	sprintf(p, "KNC_%s=%s", key, value);
-	putenv(p);
+	sprintf(name, "KNC_%s", key);
+	if (value)
+		ret = setenv(name, value, 1);
+	else
+		ret = unsetenv(name);
+	free(name);
+
+	if (ret < 0) {
+		LOG_ERRNO(LOG_ERR, ("unable to update KNC environment"));
+		return 0;
+	}
 
 	return 1;
 }
@@ -1491,13 +1499,16 @@ do_work(work_t *work, int argc, char **argv)
 	}
 
 	if (!(send_creds(local, work, "MECH", work->mech)		&&
-	      (strcmp(work->mech, "krb5") != 0			||
-	       send_creds(local, work, "CREDS", work->credentials))	&&
+	      send_creds(local, work, "CREDS",
+		  strcmp(work->mech, "krb5") == 0 ?
+		  work->credentials : NULL)			&&
 	      send_creds(local, work, "EXPORT_NAME", work->export_name)	&&
-	      (work->network_family != AF_INET			||
-	       send_creds(local, work, "REMOTE_IP", work->network_addr))&&
-	      (work->network_family != AF_INET6			||
-	       send_creds(local, work, "REMOTE_IP6", work->network_addr))&&
+	      send_creds(local, work, "REMOTE_IP",
+		  work->network_family == AF_INET ?
+		  work->network_addr : NULL)			&&
+	      send_creds(local, work, "REMOTE_IP6",
+		  work->network_family == AF_INET6 ?
+		  work->network_addr : NULL)			&&
 	      send_creds(local, work, "REMOTE_ADDR", work->network_addr)&&
 	      send_creds(local, work, "REMOTE_PORT", work->network_port)&&
 	      send_creds(local, work, "VERSION", KNC_VERSION_STRING)	&&
