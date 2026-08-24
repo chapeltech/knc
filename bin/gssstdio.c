@@ -781,93 +781,81 @@ writen(int fd, const void *buf, ssize_t len) {
 static int
 gstd_errstring(char **str, int min_stat)
 {
-	gss_buffer_desc	 status;
+	gss_buffer_desc	 status = GSS_C_EMPTY_BUFFER;
 	OM_uint32	 new_stat;
 	OM_uint32	 msg_ctx = 0;
 	OM_uint32	 ret;
-	int		 len = 0;
+	size_t		 len = 0;
+	size_t		 separator;
 	char		*tmp;
-	char		*statstr;
-
-	/* XXXrcd this is not correct yet */
-	/* XXXwps ...and now it is. */
 
 	if (!str)
 		return -1;
 
 	*str = NULL;
-	tmp = NULL;
 
 	do {
+		status.length = 0;
+		status.value = NULL;
 		ret = gss_display_status(&new_stat, min_stat,
 		    GSS_C_MECH_CODE, GSS_C_NO_OID, &msg_ctx,
 		    &status);
 
-		/* GSSAPI strings are not NUL terminated */
-		if ((statstr = (char *)malloc(status.length + 1)) == NULL) {
-			LOG(LOG_ERR, ("unable to malloc status string "
-				      "of length %ld", status.length));
+		if (GSS_ERROR(ret)) {
+			if (status.value != NULL)
+				gss_release_buffer(&new_stat, &status);
+			free(*str);
+			*str = NULL;
+			return -1;
+		}
+
+		separator = len > 0 ? 2 : 0;
+		if (len > INT_MAX - separator ||
+		    status.length > INT_MAX - len - separator) {
 			gss_release_buffer(&new_stat, &status);
-			free(statstr);
-			free(tmp);
+			free(*str);
+			*str = NULL;
+			return -1;
+		}
+
+		tmp = realloc(*str, len + separator + status.length + 1);
+		if (!tmp) {
+			LOG(LOG_ERR, ("unable to malloc error string"));
+			gss_release_buffer(&new_stat, &status);
+			free(*str);
+			*str = NULL;
 			return 0;
 		}
-
-		memcpy(statstr, status.value, status.length);
-		statstr[status.length] = '\0';
-
-		if (GSS_ERROR(ret)) {
-			free(statstr);
-			free(tmp);
-			break;
+		*str = tmp;
+		if (separator != 0) {
+			memcpy(*str + len, ", ", separator);
+			len += separator;
 		}
-
-		if (*str) {
-			if ((*str = malloc(strlen(*str) + status.length +
-					   3)) == NULL) {
-				LOG(LOG_ERR, ("unable to malloc error "
-						"string"));
-				gss_release_buffer(&new_stat, &status);
-				free(statstr);
-				free(tmp);
-				return 0;
-			}
-
-			len = sprintf(*str, "%s, %s", tmp, statstr);
-		} else {
-			*str = malloc(status.length + 1);
-			if (!*str) {
-				LOG(LOG_ERR, ("unable to malloc error "
-						"string"));
-				gss_release_buffer(&new_stat, &status);
-				free(statstr);
-				free(tmp);
-				return 0;
-			}
-			len = sprintf(*str, "%s", (char *)statstr);
-		}
-
+		if (status.length > 0)
+			memcpy(*str + len, status.value, status.length);
+		len += status.length;
+		(*str)[len] = '\0';
 		gss_release_buffer(&new_stat, &status);
-		free(statstr);
-		free(tmp);
-
-		tmp = *str;
 	} while (msg_ctx != 0);
 
-	return len;
+	if (len == 0) {
+		free(*str);
+		*str = NULL;
+	}
+
+	return (int)len;
 }
 
 void
 gstd_error(int pri, int min_stat, const char *s)
 {
-	char *t1;
+	char *t1 = NULL;
 
 	if (gstd_errstring(&t1, min_stat) < 1)
 		LOG(pri, ("%s: couldn't form GSSAPI error string", s));
-	else {
+	else
 		LOG(pri, ("%s: %s", s, t1));
-		free(t1);
-	}
+	free(t1);
 }
 
 void
