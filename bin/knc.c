@@ -83,6 +83,7 @@ int	move_network_to_local_buffer(work_t *);
 void	write_buffer_init(write_buffer_t *);
 void	work_init(work_t *);
 void	work_free(work_t *);
+void	work_close_fd(work_t *, int);
 int	shutdown_or_close(int, int);
 int	nonblocking_set(int);
 int	nonblocking_clr(int);
@@ -1503,32 +1504,6 @@ do_work(work_t *work, int argc, char **argv)
 
 	ret = move_data(work);
 
-	/*
-	 * Single ownership of network_fd: close once here and disown from
-	 * the gstd token so a later gstd_close/work_free will not double
-	 * close.  Same for local fds if do_unix_socket closes again.
-	 */
-	if (work->network_fd >= 0) {
-		close(work->network_fd);
-		work->network_fd = -1;
-		if (work->context != NULL)
-			((struct gstd_tok *)work->context)->gstd_fd = -1;
-	}
-	if (work->local_in >= 0) {
-		close(work->local_in);
-		if (work->local_out == work->local_in)
-			work->local_out = -1;
-		work->local_in = -1;
-	}
-	if (work->local_out >= 0) {
-		close(work->local_out);
-		work->local_out = -1;
-	}
-	if (work->local_err >= 0) {
-		close(work->local_err);
-		work->local_err = -1;
-	}
-
 	return ret;
 }
 
@@ -1692,18 +1667,6 @@ do_unix_socket(work_t *work)
 	work->local_in = work->local_out = fd;
 
 	ret = do_work(work, 0, 0);
-
-	/* do_work closes and sets fds to -1; guard against double-close */
-	if (work->local_in >= 0) {
-		close(work->local_in);
-		if (work->local_out == work->local_in)
-			work->local_out = -1;
-		work->local_in = -1;
-	}
-	if (work->local_out >= 0)
-		close(work->local_out);
-	if (work->network_fd >= 0)
-		close(work->network_fd);
 
 	return ret;
 }
@@ -1925,9 +1888,7 @@ do_listener(int listener, int argc, char **argv)
 				++num_children;
 		}
 
-		/* And now, as the parent, we no longer need this work
-		   structure or file descriptor */
-		close(fd);
+		/* The parent no longer needs this work structure. */
 		work_free(work);
 		free(work);
 
@@ -2061,6 +2022,26 @@ work_init(work_t *work)
 }
 
 void
+work_close_fd(work_t *work, int fd)
+{
+
+	if (fd < 0)
+		return;
+
+	/* Invalidate every alias before close so each descriptor is closed once. */
+	if (work->network_fd == fd)
+		work->network_fd = -1;
+	if (work->local_in == fd)
+		work->local_in = -1;
+	if (work->local_out == fd)
+		work->local_out = -1;
+	if (work->local_err == fd)
+		work->local_err = -1;
+
+	close(fd);
+}
+
+void
 work_free(work_t *work)
 {
 
@@ -2072,22 +2053,14 @@ work_free(work_t *work)
 	work->mech = NULL;
 
 	if (work->context != NULL) {
-		/*
-		 * If network_fd was already closed elsewhere, the token's
-		 * gstd_fd should be -1; gstd_close will not re-close it.
-		 * Otherwise gstd_close owns the close.
-		 */
-		if (work->network_fd >= 0 &&
-		    ((struct gstd_tok *)work->context)->gstd_fd ==
-		    work->network_fd)
-			work->network_fd = -1;
 		gstd_close(work->context);
 		work->context = NULL;
 	}
-	if (work->network_fd >= 0) {
-		close(work->network_fd);
-		work->network_fd = -1;
-	}
+
+	work_close_fd(work, work->network_fd);
+	work_close_fd(work, work->local_in);
+	work_close_fd(work, work->local_out);
+	work_close_fd(work, work->local_err);
 
 	free(work->service);
 	work->service = NULL;

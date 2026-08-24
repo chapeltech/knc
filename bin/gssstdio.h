@@ -68,7 +68,7 @@ struct gstd_tok {
 	gss_ctx_id_t	gstd_ctx;	/* current GSS Context */
 	gss_buffer_desc	gstd_inbuf;	/* outstanding read buffer */
 	int		gstd_inbufpos;	/* position in said buffer */
-	int		gstd_fd;	/* file descriptor for the stream */
+	int		gstd_fd;	/* borrowed descriptor for the stream */
 };
 
 int	 gstd_read(void *, char *, int);

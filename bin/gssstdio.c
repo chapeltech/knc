@@ -530,12 +530,6 @@ gstd_close(void *the_tok)
 	gss_delete_sec_context(&min, &tok->gstd_ctx, GSS_C_NO_BUFFER);
 	if (tok->gstd_inbuf.length > 0)
 		gss_release_buffer(&min, &tok->gstd_inbuf);
-	/*
-	 * The network fd may already have been closed by the caller;
-	 * only close it if we still own it.
-	 */
-	if (tok->gstd_fd >= 0)
-		close(tok->gstd_fd);
 	free(tok);
 	return 0;
 }
