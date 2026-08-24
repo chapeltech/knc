@@ -735,7 +735,12 @@ get_ostreamv(stream s, int maxcnt, struct iovec **vec,
 	}
 
 	*count = i;
-	stream_put_trash(s, *vec);
+	if (stream_put_trash(s, *vec) < 0) {
+		free(*vec);
+		*vec = NULL;
+		*count = 0;
+		return 0;
+	}
 
 	return len;
 }
@@ -776,7 +781,11 @@ get_ostream_contig(stream s, void **buf, size_t len)
 	*buf = malloc(len);
 	if (*buf == NULL)
 		return 0;
-	stream_put_trash(s, *buf);
+	if (stream_put_trash(s, *buf) < 0) {
+		free(*buf);
+		*buf = NULL;
+		return 0;
+	}
 
 	retlen = 0;
 	cur = s->cur;
@@ -974,8 +983,10 @@ read_packet(knc_ctx ctx, stream s, void **buf)
 	DEBUG((NULL, "read_packet: getting %u bytes\n", wirelen));
 	len = get_ostream_contig(s, buf, wirelen);
 
-	if (len != wirelen)
-		abort();	/* XXXrcd: really shouldn't happen. */
+	if (len != wirelen) {
+		knc_enomem(ctx);
+		return 0;
+	}
 
 	stream_drain(s, len);
 
