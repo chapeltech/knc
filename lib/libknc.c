@@ -325,14 +325,20 @@ get_stream_bit(stream s)
 static void
 rel_stream_bit(stream s, stream_bit bit)
 {
+	uintptr_t	base;
+	uintptr_t	ptr;
 	size_t	idx;
 
-	idx = bit - s->bits;
-	if (idx >= NUM_STREAM_BITS) {
+	base = (uintptr_t)&s->bits[0];
+	ptr = (uintptr_t)bit;
+	if (ptr < base || ptr - base >= sizeof(s->bits)) {
 		free(bit);
 		return;
 	}
+	if ((ptr - base) % sizeof(s->bits[0]) != 0)
+		return;
 
+	idx = (ptr - base) / sizeof(s->bits[0]);
 	s->bits_table |= 1 << idx;
 }
 
@@ -357,18 +363,24 @@ get_stream_buf(stream s, size_t len)
 static void
 rel_stream_buf(stream s, void *buf)
 {
-	ptrdiff_t	d;
+	uintptr_t	base;
+	uintptr_t	ptr;
+	size_t		d;
 	size_t		idx;
 
-	d = (char *)buf - (char *)s->bufs[0];
-	if (d < 0 || d > 2 * STREAM_BIT_ALLOC_UNIT * NUM_STREAM_BUFS) {
+	base = (uintptr_t)&s->bufs[0][0];
+	ptr = (uintptr_t)buf;
+	if (ptr < base || ptr - base >= sizeof(s->bufs)) {
 		/* This isn't one of ours, free it. */
 		free(buf);
 		return;
 	}
 
-	idx = d / (2 * STREAM_BIT_ALLOC_UNIT);
-	assert(idx * 2 * STREAM_BIT_ALLOC_UNIT == (size_t) d);
+	d = ptr - base;
+	if (d % sizeof(s->bufs[0]) != 0)
+		return;
+
+	idx = d / sizeof(s->bufs[0]);
 
 	s->bufs_table |= 1 << idx;
 }
