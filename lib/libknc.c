@@ -1010,6 +1010,8 @@ knc_ctx_init(void)
 	knc_ctx	ret;
 
 	ret = calloc(1, sizeof(*ret));
+	if (!ret)
+		return NULL;
 
 	/* Set some reasonable defaults */
 
