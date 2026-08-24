@@ -198,6 +198,81 @@ fi
 
 AC_SUBST(WFLAGS)dnl
 
+# Enable exploit mitigations by default, but probe each toolchain feature so
+# non-ELF and older systems can continue to build KNC.
+AC_ARG_ENABLE([hardening],
+	[AS_HELP_STRING([--disable-hardening],
+		[disable compiler and linker exploit mitigations])],,
+	[enable_hardening=yes])
+
+HARDEN_CPPFLAGS=
+HARDEN_CFLAGS=
+HARDEN_LDFLAGS=
+HARDEN_PIE_CFLAGS=
+HARDEN_PIE_LDFLAGS=
+
+if test "x$enable_hardening" = xyes; then
+	AC_CACHE_CHECK([whether $CC supports -fstack-protector-strong],
+	    [knc_cv_cc_stack_protector_strong], [
+		save_CFLAGS=$CFLAGS
+		CFLAGS="$CFLAGS -Werror -fstack-protector-strong"
+		AC_LINK_IFELSE([AC_LANG_PROGRAM([], [])],
+		    [knc_cv_cc_stack_protector_strong=yes],
+		    [knc_cv_cc_stack_protector_strong=no])
+		CFLAGS=$save_CFLAGS
+	])
+	if test "x$knc_cv_cc_stack_protector_strong" = xyes; then
+		HARDEN_CFLAGS="$HARDEN_CFLAGS -fstack-protector-strong"
+	fi
+
+	AC_CACHE_CHECK([whether $CC supports PIE executables],
+	    [knc_cv_cc_pie], [
+		save_CFLAGS=$CFLAGS
+		save_LDFLAGS=$LDFLAGS
+		CFLAGS="$CFLAGS -Werror -fPIE"
+		LDFLAGS="$LDFLAGS -pie"
+		AC_LINK_IFELSE([AC_LANG_PROGRAM([], [])],
+		    [knc_cv_cc_pie=yes], [knc_cv_cc_pie=no])
+		CFLAGS=$save_CFLAGS
+		LDFLAGS=$save_LDFLAGS
+	])
+	if test "x$knc_cv_cc_pie" = xyes; then
+		HARDEN_PIE_CFLAGS=-fPIE
+		HARDEN_PIE_LDFLAGS=-pie
+	fi
+
+	AC_CACHE_CHECK([whether the linker supports RELRO and immediate binding],
+	    [knc_cv_ld_relro_now], [
+		save_CFLAGS=$CFLAGS
+		save_LDFLAGS=$LDFLAGS
+		CFLAGS="$CFLAGS -Werror"
+		LDFLAGS="$LDFLAGS -Wl,-z,relro -Wl,-z,now"
+		AC_LINK_IFELSE([AC_LANG_PROGRAM([], [])],
+		    [knc_cv_ld_relro_now=yes], [knc_cv_ld_relro_now=no])
+		CFLAGS=$save_CFLAGS
+		LDFLAGS=$save_LDFLAGS
+	])
+	if test "x$knc_cv_ld_relro_now" = xyes; then
+		HARDEN_LDFLAGS="-Wl,-z,relro -Wl,-z,now"
+	fi
+
+	case " $CPPFLAGS " in
+	*-D_FORTIFY_SOURCE=*) ;;
+	*)
+		case " $CFLAGS " in
+		*-O0*) ;;
+		*-O*) HARDEN_CPPFLAGS=-D_FORTIFY_SOURCE=2 ;;
+		esac
+		;;
+	esac
+fi
+
+AC_SUBST([HARDEN_CPPFLAGS])
+AC_SUBST([HARDEN_CFLAGS])
+AC_SUBST([HARDEN_LDFLAGS])
+AC_SUBST([HARDEN_PIE_CFLAGS])
+AC_SUBST([HARDEN_PIE_LDFLAGS])
+
 # Checks for typedefs, structures, and compiler characteristics.
 AC_TYPE_PID_T
 AC_TYPE_SIZE_T
