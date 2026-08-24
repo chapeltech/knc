@@ -413,9 +413,11 @@ alloc_stream_bit(stream s, int type, size_t len)
 {
 	stream_bit	 bit;
 
-	len  = len / STREAM_BIT_ALLOC_UNIT + (len % STREAM_BIT_ALLOC_UNIT)?1:0;
-	len *= STREAM_BIT_ALLOC_UNIT;
-	len  = MIN((2 * STREAM_BIT_ALLOC_UNIT), len);
+	if (len == 0)
+		return NULL;
+	len = MIN((2 * STREAM_BIT_ALLOC_UNIT), len);
+	len = ((len + STREAM_BIT_ALLOC_UNIT - 1) / STREAM_BIT_ALLOC_UNIT) *
+	    STREAM_BIT_ALLOC_UNIT;
 
 	bit = get_stream_bit(s);
 	if (!bit)
@@ -567,15 +569,18 @@ put_stream_command(stream s, void *buf, size_t len)
 	if (s->tail)
 		s->tail->allocated = s->tail->len;
 
-	/*
-	 * XXXrcd: might be an idea to use a new alloc which doesn't
-	 *         try to make a buffer that we can grow into per se.
-	 */
-	tmp = alloc_stream_bit(s, STREAM_COMMAND, len);
+	tmp = get_stream_bit(s);
 	if (!tmp)
 		return 0;
+	tmp->buf = get_stream_buf(s, len);
+	if (!tmp->buf) {
+		rel_stream_bit(s, tmp);
+		return 0;
+	}
 
-	memcpy(tmp->buf, buf, len);
+	if (len > 0)
+		memcpy(tmp->buf, buf, len);
+	tmp->type = STREAM_COMMAND;
 	tmp->len = len;
 	tmp->allocated = len;
 
@@ -2113,10 +2118,19 @@ knc_put_command(knc_ctx ctx, const char *cmd, uint32_t cmdseqno,
 {
 	char	*buf;
 	char	*tmp;
+	size_t	 cmdlen;
 	size_t	 len = 0;
 	size_t	 tlen = 0;
+	size_t	 ret;
 
-	len = sizeof(cmdseqno) + strlen(cmd) + 1 + sizeof(datalen) + datalen;
+	if (!ctx || !cmd || (datalen > 0 && !data))
+		return 0;
+
+	cmdlen = strlen(cmd) + 1;
+	if (cmdlen > SIZE_MAX - sizeof(cmdseqno) - sizeof(datalen) - datalen)
+		return 0;
+
+	len = sizeof(cmdseqno) + cmdlen + sizeof(datalen) + datalen;
 	tmp = buf = malloc(len);
 	if (!buf)
 		return 0;
@@ -2127,10 +2141,10 @@ knc_put_command(knc_ctx ctx, const char *cmd, uint32_t cmdseqno,
 	tmp += sizeof(cmdseqno);
 	tlen += sizeof(cmdseqno);
 
-	strcpy(tmp, cmd);
+	memcpy(tmp, cmd, cmdlen);
 
-	tmp += strlen(cmd) + 1;
-	tlen += strlen(cmd) + 1;
+	tmp += cmdlen;
+	tlen += cmdlen;
 
 	datalen = htonl(datalen);
 	memcpy(tmp, &datalen, sizeof(datalen));
@@ -2149,7 +2163,9 @@ knc_put_command(knc_ctx ctx, const char *cmd, uint32_t cmdseqno,
 
 	knc_debugf(ctx, "putting command: %s seq=%u\n", cmd, cmdseqno);
 
-	return put_stream_command(&ctx->raw_send, buf, len);
+	ret = put_stream_command(&ctx->raw_send, buf, len);
+	free(buf);
+	return ret;
 }
 
 size_t

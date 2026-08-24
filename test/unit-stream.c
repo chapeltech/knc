@@ -203,6 +203,39 @@ test_pollfds_accepts_fd_zero_and_exact_capacity(void)
 	}
 }
 
+static void
+test_large_command_uses_exact_storage(void)
+{
+	const char	 command[] = "large-test";
+	unsigned char	*data;
+	unsigned char	*wire;
+	knc_ctx		 ctx;
+	size_t		 expected;
+	size_t		 len;
+	size_t		 ret;
+	uint32_t	 datalen = 3 * STREAM_BIT_ALLOC_UNIT;
+
+	data = malloc(datalen);
+	check(data != NULL, "large command data allocation failed");
+	memset(data, 0x5a, datalen);
+	ctx = knc_ctx_init();
+	check(ctx != NULL, "knc_ctx_init failed");
+
+	expected = sizeof(uint32_t) + sizeof(command) + sizeof(uint32_t) +
+	    datalen;
+	ret = knc_put_command(ctx, command, 7, data, datalen);
+	check(ret == expected, "large command was not queued completely");
+	wire = knc_get_stream_command(&ctx->raw_send, &len);
+	check(wire != NULL && len == expected,
+	    "large command storage length was truncated");
+	check(memcmp(wire + sizeof(uint32_t), command, sizeof(command)) == 0,
+	    "large command name was corrupted");
+	check(wire[len - 1] == 0x5a, "large command data was truncated");
+
+	knc_ctx_destroy(ctx);
+	free(data);
+}
+
 int
 main(void)
 {
@@ -212,6 +245,7 @@ main(void)
 	test_cloexec_uses_descriptor_flags();
 	test_ostreamv_honours_vector_limit();
 	test_pollfds_accepts_fd_zero_and_exact_capacity();
+	test_large_command_uses_exact_storage();
 
 	return 0;
 }
