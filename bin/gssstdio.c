@@ -670,7 +670,8 @@ read_packet(int fd, gss_buffer_t buf, const struct timespec *deadline,
 		return -2;
 
 	/* We have the complete length */
-	len = ntohl(*(uint32_t *)len_buf);
+	memcpy(&len, len_buf, sizeof(len));
+	len = ntohl(len);
 
 	/*
 	 * We make sure recvd length is reasonable, allowing for some

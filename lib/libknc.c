@@ -930,7 +930,8 @@ read_packet(knc_ctx ctx, stream s, void **buf)
 	if (get_ostream_contig(s, &tmp, 4) < 4)
 		return 0;
 
-	wirelen = ntohl(*((uint32_t *)tmp));
+	memcpy(&wirelen, tmp, sizeof(wirelen));
+	wirelen = ntohl(wirelen);
 
 	DEBUG((NULL, "read_packet: got wirelen = %u\n", wirelen));
 
