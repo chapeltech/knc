@@ -105,12 +105,42 @@ test_fill_reports_state_handler_failure(void)
 	close(fds[1]);
 }
 
+static void
+test_cloexec_uses_descriptor_flags(void)
+{
+	knc_ctx	ctx;
+	int	fds[2];
+
+	check(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0,
+	    "socketpair failed");
+	ctx = knc_ctx_init();
+	check(ctx != NULL, "knc_ctx_init failed");
+	knc_set_net_fds(ctx, fds[0], fds[1]);
+
+	knc_set_opt(ctx, KNC_SOCK_CLOEXEC, 1);
+	check((fcntl(fds[0], F_GETFD) & FD_CLOEXEC) != 0,
+	    "CLOEXEC was not set on the read descriptor");
+	check((fcntl(fds[1], F_GETFD) & FD_CLOEXEC) != 0,
+	    "CLOEXEC was not set on the write descriptor");
+
+	knc_set_opt(ctx, KNC_SOCK_CLOEXEC, 0);
+	check((fcntl(fds[0], F_GETFD) & FD_CLOEXEC) == 0,
+	    "CLOEXEC was not cleared on the read descriptor");
+	check((fcntl(fds[1], F_GETFD) & FD_CLOEXEC) == 0,
+	    "CLOEXEC was not cleared on the write descriptor");
+
+	knc_ctx_destroy(ctx);
+	close(fds[0]);
+	close(fds[1]);
+}
+
 int
 main(void)
 {
 
 	test_input_reuses_only_reachable_tail_space();
 	test_fill_reports_state_handler_failure();
+	test_cloexec_uses_descriptor_flags();
 
 	return 0;
 }

@@ -2227,22 +2227,34 @@ knc_initiate(knc_ctx ctx)
 static int
 socket_options(int s, int opts)
 {
-	int	flags;
+	int	fdflags;
+	int	statusflags;
 
-	flags = fcntl(s, F_GETFL, 0);
+	statusflags = fcntl(s, F_GETFL, 0);
+	if (statusflags < 0)
+		return -1;
 
-	flags &= ~(O_NONBLOCK|O_CLOEXEC);
+	statusflags &= ~O_NONBLOCK;
 
 	if (opts & KNC_SOCK_NONBLOCK)
-		flags |= O_NONBLOCK;
-	if (opts & KNC_SOCK_CLOEXEC)
-		flags |= O_CLOEXEC;
+		statusflags |= O_NONBLOCK;
 
 #ifdef O_NOSIGPIPE
-	flags |= O_NOSIGPIPE;
+	statusflags |= O_NOSIGPIPE;
 #endif
 
-	return fcntl(s, F_SETFL, flags);
+	if (fcntl(s, F_SETFL, statusflags) < 0)
+		return -1;
+
+	fdflags = fcntl(s, F_GETFD, 0);
+	if (fdflags < 0)
+		return -1;
+	if (opts & KNC_SOCK_CLOEXEC)
+		fdflags |= FD_CLOEXEC;
+	else
+		fdflags &= ~FD_CLOEXEC;
+
+	return fcntl(s, F_SETFD, fdflags);
 }
 
 static int
@@ -2258,10 +2270,10 @@ get_socket(int d, int t, int p, int opts)
 	t |= I_SOCK_NOSIGPIPE;
 
 	s = socket(d, t, p);
-
-#if !(I_SOCK_NONBLOCK || I_SOCK_CLOEXEC || I_SOCK_NOSIGPIPE)
-	socket_options(s, opts);
-#endif
+	if (s >= 0 && socket_options(s, opts) < 0) {
+		close(s);
+		return -1;
+	}
 
 	return s;
 }
