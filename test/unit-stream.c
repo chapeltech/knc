@@ -134,6 +134,36 @@ test_cloexec_uses_descriptor_flags(void)
 	close(fds[1]);
 }
 
+static void
+test_ostreamv_honours_vector_limit(void)
+{
+	char		 first[STREAM_BIT_ALLOC_UNIT];
+	char		 second[STREAM_BIT_ALLOC_UNIT];
+	struct iovec	*vec;
+	knc_ctx		 ctx;
+	size_t		 len;
+	int		 count;
+
+	memset(first, 'a', sizeof(first));
+	memset(second, 'b', sizeof(second));
+	ctx = knc_ctx_init();
+	check(ctx != NULL, "knc_ctx_init failed");
+	check(put_stream(&ctx->cooked_recv, first, sizeof(first)) ==
+	    sizeof(first), "first put_stream failed");
+	check(put_stream(&ctx->cooked_recv, second, sizeof(second)) ==
+	    sizeof(second), "second put_stream failed");
+
+	len = get_ostreamv(&ctx->cooked_recv, 1, &vec, &count);
+	check(count == 1, "get_ostreamv exceeded maxcnt");
+	check(len == STREAM_BIT_ALLOC_UNIT,
+	    "get_ostreamv returned bytes beyond maxcnt");
+	check(vec[0].iov_len == STREAM_BIT_ALLOC_UNIT,
+	    "get_ostreamv returned the wrong first vector length");
+	knc_garbage_collect(ctx);
+
+	knc_ctx_destroy(ctx);
+}
+
 int
 main(void)
 {
@@ -141,6 +171,7 @@ main(void)
 	test_input_reuses_only_reachable_tail_space();
 	test_fill_reports_state_handler_failure();
 	test_cloexec_uses_descriptor_flags();
+	test_ostreamv_honours_vector_limit();
 
 	return 0;
 }

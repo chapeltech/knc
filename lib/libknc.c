@@ -668,10 +668,15 @@ get_ostreamv(stream s, int maxcnt, struct iovec **vec,
 	     int *count)
 {
 	stream_bit	cur;
+	int		bitcnt;
 	int		i;
 	size_t		len;
 
-	if (!s || !s->cur)
+	if (vec)
+		*vec = NULL;
+	if (count)
+		*count = 0;
+	if (!s || !s->cur || !vec || !count || maxcnt <= 0)
 		/* Nothing here */
 		return 0;
 
@@ -683,13 +688,11 @@ get_ostreamv(stream s, int maxcnt, struct iovec **vec,
 
 	/* First we count the bits. */
 
-	i = 0;
-	for (cur = s->cur; cur; cur = cur->next)
-		/* XXXrcd: test length and all of that? */
-		if (i++ == maxcnt)
-			break;
+	bitcnt = 0;
+	for (cur = s->cur; cur && bitcnt < maxcnt; cur = cur->next)
+		++bitcnt;
 
-	*vec = malloc(i * sizeof(**vec));
+	*vec = malloc(bitcnt * sizeof(**vec));
 	if (!*vec) {
 		/* XXXrcd: better errors... */
 		return 0;
@@ -705,14 +708,13 @@ get_ostreamv(stream s, int maxcnt, struct iovec **vec,
 	DEBUG((NULL, "creating iovec element of length %zu, total %zu\n",
 	    len, len));
 
-	for (cur = cur->next; cur; cur = cur->next) {
+	for (cur = cur->next; cur && i < bitcnt; cur = cur->next) {
 		(*vec)[i].iov_base = cur->buf;
 		(*vec)[i].iov_len  = cur->len;
 		len += cur->len;
 		DEBUG((NULL, "creating iovec element of length %zu, "
 		    "total %zu\n", cur->len, len));
-		if (i++ == maxcnt)
-			break;
+		++i;
 	}
 
 	*count = i;
