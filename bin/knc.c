@@ -36,6 +36,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <netdb.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -257,6 +258,9 @@ xstrdup(const char *orig)
 void
 parse_opt(const char *prognam, const char *opt)
 {
+	const char	*value;
+	char		*end;
+	long		 seconds;
 
 	if (!strcmp(opt, "keepalive")) {
 		prefs.so_keepalive = 1;
@@ -275,6 +279,22 @@ parse_opt(const char *prognam, const char *opt)
 
 	if (!strcmp(opt, "noprivate")) {
 		prefs.noprivacy = 1;
+		return;
+	}
+
+	if (!strncmp(opt, "handshake-timeout=",
+	    strlen("handshake-timeout="))) {
+		value = opt + strlen("handshake-timeout=");
+		errno = 0;
+		seconds = strtol(value, &end, 10);
+		if (errno != 0 || *value == '\0' || *end != '\0' || seconds < 1 ||
+		    seconds > INT_MAX / 1000) {
+			fprintf(stderr, "option \"-o %s\" requires a positive "
+			    "number of seconds\n", "handshake-timeout=");
+			usage(prognam);
+			exit(1);
+		}
+		prefs.handshake_timeout = (int)seconds;
 		return;
 	}
 
@@ -343,6 +363,7 @@ main(int argc, char **argv)
 	prefs.use_dns = 1;
 	prefs.debug_level = LOG_INFO;		/* display LOG_INFO and worse */
 	prefs.num_children_max = 128;
+	prefs.handshake_timeout = 60;
 	prefs.progname = xstrdup(argv[0]);	/* facilitate stderr logs */
 	prefs.network_fd = -1;			/* wrap connection around
 						   existing socket */

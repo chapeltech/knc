@@ -126,6 +126,9 @@ Currently, the following options are implemented:
 .Bl -tag -width no-half-closeXX
 .It Ar keepalive
 enables TCP keepalives.
+.It Ar handshake-timeout=seconds
+sets the maximum time allowed for an incoming authentication exchange.
+The default is 60 seconds.
 .It Ar no-half-close
 disable the half close functionality.
 .It Ar noprivacy

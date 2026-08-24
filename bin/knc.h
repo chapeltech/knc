@@ -39,6 +39,7 @@ typedef struct prefs_s {
 	int			no_half_close;
 	int			noprivacy;
 	int			num_children_max;
+	int			handshake_timeout;
 	int			max_connections;
 	int			max_time;
 	char			use_dns;

@@ -58,6 +58,7 @@
 /* #include <netdb.h> */
 
 #include <errno.h>
+#include <limits.h>
 #include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -65,6 +66,7 @@
 #include <strings.h>
 #include <stdarg.h>
 #include <syslog.h>
+#include <time.h>
 #include <unistd.h>
 
 /* this include must be before krb5/resolve.conf for things to work */
@@ -79,8 +81,9 @@ extern gss_OID global_mech;
 /* The rest of them are internal utility functions */
 
 static int	write_packet(int, gss_buffer_t);
-static ssize_t	timed_read(int, void *, size_t, int);
-static int	read_packet(int, gss_buffer_t, int, int);
+static int	set_deadline(struct timespec *, int);
+static ssize_t	timed_read(int, void *, size_t, const struct timespec *);
+static int	read_packet(int, gss_buffer_t, const struct timespec *, int);
 static int	gstd_errstring(char **, int);
 static int	gstd_oid_equal(gss_OID, gss_OID);
 static char	*gstd_oid_to_hex(gss_OID);
@@ -287,15 +290,20 @@ gstd_accept(int fd, char **display_creds, char **export_name, char **mech)
 	gss_buffer_desc	 in, out;
 	OM_uint32	 maj, min;
 	OM_uint32	 ret_flags = 0;
+	struct timespec	 deadline;
 	int		 ret;
 
 	*display_creds = NULL;
 	*export_name = NULL;
 	out.length = 0;
 	in.length = 0;
-	read_packet(fd, &in, 60000, 1);
+	if (set_deadline(&deadline, prefs.handshake_timeout * 1000) < 0) {
+		LOG_ERRNO(LOG_ERR, ("unable to set authentication deadline"));
+		return NULL;
+	}
+	read_packet(fd, &in, &deadline, 1);
 again:
-	while ((ret = read_packet(fd, &in, 60000, 0)) == -2)
+	while ((ret = read_packet(fd, &in, &deadline, 0)) == -2)
 		;
 
 	if (ret < 1)
@@ -397,7 +405,7 @@ again:
 
 	if (maj & GSS_S_CONTINUE_NEEDED) {
 		LOG(LOG_DEBUG, ("continuing gstd_initiate"));
-		while ((ret = read_packet(fd, &in, 0, 0)) == -2)
+		while ((ret = read_packet(fd, &in, NULL, 0)) == -2)
 			;
 
 		if (ret < 1) {
@@ -445,7 +453,7 @@ gstd_read(void *the_tok, char *buf, int length)
 		 * If we encounter a protocol botch or if the other side has
 		 * closed the connection, we return that fact here
 		 */
-		ret = read_packet(tok->gstd_fd, &in, 0, 0);
+		ret = read_packet(tok->gstd_fd, &in, NULL, 0);
 		if (ret <= 0)
 			return ret;
 
@@ -535,12 +543,37 @@ gstd_close(void *the_tok)
 }
 
 static ssize_t
-timed_read(int fd, void *buf, size_t bytes, int timeout)
+timed_read(int fd, void *buf, size_t bytes, const struct timespec *deadline)
 {
 	struct pollfd		fds[1];
+	struct timespec		now;
+	time_t			seconds;
+	long			nanoseconds;
+	int			timeout;
 	int			ret;
 
-	if (timeout > 0) {
+	if (deadline != NULL) {
+		if (clock_gettime(CLOCK_MONOTONIC, &now) < 0)
+			return -1;
+
+		seconds = deadline->tv_sec - now.tv_sec;
+		nanoseconds = deadline->tv_nsec - now.tv_nsec;
+		if (nanoseconds < 0) {
+			--seconds;
+			nanoseconds += 1000000000L;
+		}
+
+		if (seconds < 0 || (seconds == 0 && nanoseconds == 0)) {
+			errno = ETIMEDOUT;
+			return -1;
+		}
+
+		if (seconds >= INT_MAX / 1000)
+			timeout = INT_MAX;
+		else
+			timeout = (int)(seconds * 1000) +
+			    (int)((nanoseconds + 999999L) / 1000000L);
+
 		fds[0].fd = fd;
 		fds[0].events = POLLIN;
 
@@ -558,6 +591,23 @@ timed_read(int fd, void *buf, size_t bytes, int timeout)
 	return read(fd, buf, bytes);
 }
 
+static int
+set_deadline(struct timespec *deadline, int timeout)
+{
+
+	if (clock_gettime(CLOCK_MONOTONIC, deadline) < 0)
+		return -1;
+
+	deadline->tv_sec += timeout / 1000;
+	deadline->tv_nsec += (timeout % 1000) * 1000000L;
+	if (deadline->tv_nsec >= 1000000000L) {
+		++deadline->tv_sec;
+		deadline->tv_nsec -= 1000000000L;
+	}
+
+	return 0;
+}
+
 /*
  * Returns:
  *	-2	Need to call again
@@ -567,7 +617,8 @@ timed_read(int fd, void *buf, size_t bytes, int timeout)
  *	1       Data has been completely received
  */
 static int
-read_packet(int fd, gss_buffer_t buf, int timeout, int first)
+read_packet(int fd, gss_buffer_t buf, const struct timespec *deadline,
+    int first)
 {
 	int	  ret;
 
@@ -588,7 +639,7 @@ read_packet(int fd, gss_buffer_t buf, int timeout, int first)
 
 	if (len_buf_pos < 4) {
 		ret = timed_read(fd, &len_buf[len_buf_pos], 4 - len_buf_pos,
-		    timeout);
+		    deadline);
 
 		if (ret == -1) {
 			if (errno == EINTR || errno == EAGAIN)
@@ -638,7 +689,7 @@ read_packet(int fd, gss_buffer_t buf, int timeout, int first)
 		}
 	}
 
-	ret = timed_read(fd, tmpbuf + tmpbuf_pos, len - tmpbuf_pos, timeout);
+	ret = timed_read(fd, tmpbuf + tmpbuf_pos, len - tmpbuf_pos, deadline);
 	if (ret == -1) {
 
 		if (errno == EINTR || errno == EAGAIN)
