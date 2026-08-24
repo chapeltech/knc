@@ -758,6 +758,9 @@ returns the number of entries in
 and
 .Ar cbs
 that are filled in.
+If the supplied arrays are too small, it returns
+.Po Vt nfds_t Pc Ns -1
+without writing beyond them.
 Entries that are not filled in are not touched and will therefore likely
 contain garbage.
 The callbacks should be called for

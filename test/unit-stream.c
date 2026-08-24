@@ -164,6 +164,45 @@ test_ostreamv_honours_vector_limit(void)
 	knc_ctx_destroy(ctx);
 }
 
+static void
+test_pollfds_accepts_fd_zero_and_exact_capacity(void)
+{
+	knc_callback	cbs[1];
+	struct pollfd	pollfds[1];
+	knc_ctx		ctx;
+	nfds_t		count;
+	int		fds[2];
+	int		saved_stdin;
+
+	saved_stdin = dup(STDIN_FILENO);
+	close(STDIN_FILENO);
+	check(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0,
+	    "socketpair failed");
+	check(fds[0] == STDIN_FILENO, "socketpair did not allocate fd zero");
+
+	ctx = knc_ctx_init();
+	check(ctx != NULL, "knc_ctx_init failed");
+	knc_set_net_fd(ctx, fds[0]);
+	count = knc_get_pollfds(ctx, pollfds, cbs, 1);
+	check(count == 1, "exact pollfd capacity was rejected");
+	check(pollfds[0].fd == STDIN_FILENO,
+	    "file descriptor zero was omitted from pollfds");
+
+	pollfds[0].fd = 123;
+	count = knc_get_pollfds(ctx, pollfds, cbs, 0);
+	check(count == (nfds_t)-1, "zero pollfd capacity was accepted");
+	check(pollfds[0].fd == 123, "pollfds was written beyond capacity");
+
+	knc_ctx_destroy(ctx);
+	close(fds[0]);
+	close(fds[1]);
+	if (saved_stdin >= 0) {
+		check(dup2(saved_stdin, STDIN_FILENO) == STDIN_FILENO,
+		    "failed to restore stdin");
+		close(saved_stdin);
+	}
+}
+
 int
 main(void)
 {
@@ -172,6 +211,7 @@ main(void)
 	test_fill_reports_state_handler_failure();
 	test_cloexec_uses_descriptor_flags();
 	test_ostreamv_honours_vector_limit();
+	test_pollfds_accepts_fd_zero_and_exact_capacity();
 
 	return 0;
 }

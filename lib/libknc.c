@@ -2614,44 +2614,51 @@ knc_get_pollfds(knc_ctx ctx, struct pollfd *fds, knc_callback *cbs,
 		nfds_t nfds)
 {
 	nfds_t	i = 0;
+	int	fd;
 
 	if (!ctx)
 		return 0;
+	if (!fds || !cbs)
+		return (nfds_t)-1;
 
-	if (knc_get_net_rfd(ctx) && knc_need_input(ctx, KNC_DIR_RECV)) {
+	fd = knc_get_net_rfd(ctx);
+	if (fd >= 0 && knc_need_input(ctx, KNC_DIR_RECV)) {
+		if (i >= nfds)
+			return (nfds_t)-1;
 		cbs[i]		= _fill_recv;
-		fds[i].fd	= knc_get_net_rfd(ctx);
+		fds[i].fd	= fd;
 		fds[i++].events	= POLLIN;
-		if (i >= nfds)
-			return (nfds_t)-1;
 	}
 
-	if (knc_get_net_wfd(ctx) != -1 && knc_can_output(ctx, KNC_DIR_SEND)) {
+	fd = knc_get_net_wfd(ctx);
+	if (fd >= 0 && knc_can_output(ctx, KNC_DIR_SEND)) {
+		if (i >= nfds)
+			return (nfds_t)-1;
 		cbs[i]		= _flush_send;
-		fds[i].fd	= knc_get_net_wfd(ctx);
+		fds[i].fd	= fd;
 		fds[i++].events = POLLOUT;
-		if (i >= nfds)
-			return (nfds_t)-1;
 	}
 
-	if (knc_get_local_rfd(ctx) != -1 &&
-	    knc_need_input(ctx, KNC_DIR_SEND)) {
+	fd = knc_get_local_rfd(ctx);
+	if (fd >= 0 && knc_need_input(ctx, KNC_DIR_SEND)) {
 		/*
 		 * Here, we are reading unframed bytes and so we size our
 		 * buffer as the slightly more accurate raw+cooked size for
 		 * comparison.
 		 */
-		cbs[i]		= _fill_send;
-		fds[i].fd	 = knc_get_local_rfd(ctx);
-		fds[i++].events	 = POLLIN;
 		if (i >= nfds)
 			return (nfds_t)-1;
+		cbs[i]		= _fill_send;
+		fds[i].fd	 = fd;
+		fds[i++].events	 = POLLIN;
 	}
 
-	if (knc_get_local_wfd(ctx) != -1 &&
-	    knc_can_output(ctx, KNC_DIR_RECV)) {
+	fd = knc_get_local_wfd(ctx);
+	if (fd >= 0 && knc_can_output(ctx, KNC_DIR_RECV)) {
+		if (i >= nfds)
+			return (nfds_t)-1;
 		cbs[i]		= _flush_recv;
-		fds[i].fd	 = knc_get_local_wfd(ctx);
+		fds[i].fd	 = fd;
 		fds[i++].events	 = POLLOUT;
 	}
 
