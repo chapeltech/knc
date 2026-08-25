@@ -45,6 +45,14 @@
 .Fn knc_get_client "knc_ctx ctx"
 .Ft gss_name_t
 .Fn knc_get_service "knc_ctx ctx"
+.Ft int
+.Fn knc_get_client_display_name "knc_ctx ctx" "char **display" "size_t *display_len"
+.Ft int
+.Fn knc_get_service_display_name "knc_ctx ctx" "char **display" "size_t *display_len"
+.Ft int
+.Fn knc_get_mech_display_name "knc_ctx ctx" "char **display" "size_t *display_len"
+.Ft void
+.Fn knc_free_display_name "char *display"
 .Fn knc_set_cred "knc_ctx ctx" "gss_cred_id_t cred"
 .Ft void
 .Fn knc_set_service "knc_ctx ctx" "gss_name_t gssname"
@@ -472,6 +480,16 @@ defined:
 returns the client's name.  Do not release this function's return value.
 .It Fn knc_get_service
 returns the service's name.  Do not release this function's return value.
+.It Fn knc_get_client_display_name ctx display display_len
+returns the authenticated client's GSS display name as a newly allocated,
+NUL-terminated string and records its byte length in
+.Fa display_len .
+.It Fn knc_get_service_display_name ctx display display_len
+returns the authenticated service's GSS display name in the same form.
+.It Fn knc_get_mech_display_name ctx display display_len
+returns the negotiated mechanism OID's display form in the same form.
+.It Fn knc_free_display_name display
+releases a string returned by one of the display-name functions.
 .It Fn knc_get_ret_mech ctx
 returns the GSS mechanism returned by either
 .Fn gss_accept_sec_context

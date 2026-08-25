@@ -1457,7 +1457,7 @@ knc_get_service(knc_ctx ctx)
 	if (!ctx || !knc_is_authenticated(ctx))
 		return GSS_C_NO_NAME;
 
-	if (ctx->inq_service == GSS_C_NO_NAME && ctx->locally_initiated) {
+	if (ctx->inq_service == GSS_C_NO_NAME) {
 		maj = gss_inquire_context(&min, ctx->gssctx, NULL,
 		    &ctx->inq_service, NULL, NULL, NULL, NULL, NULL);
 		KNC_GSS_ERROR(ctx, maj, min, GSS_C_NO_NAME,
@@ -1465,6 +1465,107 @@ knc_get_service(knc_ctx ctx)
 	}
 
 	return ctx->inq_service;
+}
+
+static int
+knc_copy_display_buffer(knc_ctx ctx, gss_buffer_t gssbuf, char **display,
+    size_t *display_len)
+{
+	char	*copy;
+
+	if (gssbuf->value == NULL || gssbuf->length == 0 ||
+	    gssbuf->length == SIZE_MAX) {
+		knc_proto_error(ctx, "GSS display name has invalid length");
+		errno = EINVAL;
+		return -1;
+	}
+
+	copy = malloc(gssbuf->length + 1);
+	if (!copy) {
+		knc_enomem(ctx);
+		errno = ENOMEM;
+		return -1;
+	}
+	memcpy(copy, gssbuf->value, gssbuf->length);
+	copy[gssbuf->length] = '\0';
+	*display = copy;
+	*display_len = gssbuf->length;
+	return 0;
+}
+
+static int
+knc_display_name(knc_ctx ctx, gss_name_t name, char **display,
+    size_t *display_len)
+{
+	gss_buffer_desc	 out = GSS_C_EMPTY_BUFFER;
+	OM_uint32	 maj;
+	OM_uint32	 min;
+	int		 ret;
+
+	if (!ctx || !display || !display_len || name == GSS_C_NO_NAME) {
+		errno = EINVAL;
+		return -1;
+	}
+	*display = NULL;
+	*display_len = 0;
+
+	maj = gss_display_name(&min, name, &out, NULL);
+	KNC_GSS_ERROR(ctx, maj, min, -1, "gss_display_name");
+	ret = knc_copy_display_buffer(ctx, &out, display, display_len);
+	gss_release_buffer(&min, &out);
+	return ret;
+}
+
+int
+knc_get_client_display_name(knc_ctx ctx, char **display, size_t *display_len)
+{
+	gss_name_t	name;
+
+	name = knc_get_client(ctx);
+	if (name == GSS_C_NO_NAME)
+		return -1;
+	return knc_display_name(ctx, name, display, display_len);
+}
+
+int
+knc_get_service_display_name(knc_ctx ctx, char **display, size_t *display_len)
+{
+	gss_name_t	name;
+
+	name = knc_get_service(ctx);
+	if (name == GSS_C_NO_NAME)
+		return -1;
+	return knc_display_name(ctx, name, display, display_len);
+}
+
+int
+knc_get_mech_display_name(knc_ctx ctx, char **display, size_t *display_len)
+{
+	gss_buffer_desc	 out = GSS_C_EMPTY_BUFFER;
+	OM_uint32	 maj;
+	OM_uint32	 min;
+	int		 ret;
+
+	if (!ctx || !display || !display_len || !knc_is_authenticated(ctx) ||
+	    ctx->ret_mech == GSS_C_NO_OID) {
+		errno = EINVAL;
+		return -1;
+	}
+	*display = NULL;
+	*display_len = 0;
+
+	maj = gss_oid_to_str(&min, ctx->ret_mech, &out);
+	KNC_GSS_ERROR(ctx, maj, min, -1, "gss_oid_to_str");
+	ret = knc_copy_display_buffer(ctx, &out, display, display_len);
+	gss_release_buffer(&min, &out);
+	return ret;
+}
+
+void
+knc_free_display_name(char *display)
+{
+
+	free(display);
 }
 
 gss_cred_id_t
