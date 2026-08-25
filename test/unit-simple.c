@@ -205,6 +205,31 @@ runserver(int fd)
 	}
 
 	if (transfer) {
+		char		*client_before;
+		char		*service_before;
+		char		*mech_before;
+		char		*client_after;
+		char		*service_after;
+		char		*mech_after;
+		size_t		 client_before_len;
+		size_t		 service_before_len;
+		size_t		 mech_before_len;
+		size_t		 client_after_len;
+		size_t		 service_after_len;
+		size_t		 mech_after_len;
+		OM_uint32	 flags_before;
+
+		if (knc_get_client_display_name(ctx, &client_before,
+		    &client_before_len) == -1 ||
+		    knc_get_service_display_name(ctx, &service_before,
+		    &service_before_len) == -1 ||
+		    knc_get_mech_display_name(ctx, &mech_before,
+		    &mech_before_len) == -1) {
+			fprintf(stderr, "S: display authenticated metadata: %s\n",
+			    knc_errstr(ctx));
+			exit(1);
+		}
+		flags_before = knc_get_ret_flags(ctx);
 		newfd = dup(fd);
 		if (newfd == -1) {
 			perror("S: dup");
@@ -228,6 +253,34 @@ runserver(int fd)
 			exit(1);
 		}
 		knc_release_exported_sec_context(token, token_len);
+
+		if (knc_get_client_display_name(ctx, &client_after,
+		    &client_after_len) == -1 ||
+		    knc_get_service_display_name(ctx, &service_after,
+		    &service_after_len) == -1 ||
+		    knc_get_mech_display_name(ctx, &mech_after,
+		    &mech_after_len) == -1) {
+			fprintf(stderr, "S: display imported metadata: %s\n",
+			    knc_errstr(ctx));
+			exit(1);
+		}
+		if (client_before_len != client_after_len ||
+		    memcmp(client_before, client_after, client_before_len) != 0 ||
+		    service_before_len != service_after_len ||
+		    memcmp(service_before, service_after,
+		    service_before_len) != 0 ||
+		    mech_before_len != mech_after_len ||
+		    memcmp(mech_before, mech_after, mech_before_len) != 0 ||
+		    flags_before != knc_get_ret_flags(ctx)) {
+			fprintf(stderr, "S: imported authentication metadata changed\n");
+			exit(1);
+		}
+		knc_free_display_name(client_before);
+		knc_free_display_name(service_before);
+		knc_free_display_name(mech_before);
+		knc_free_display_name(client_after);
+		knc_free_display_name(service_after);
+		knc_free_display_name(mech_after);
 	}
 
 	for (;;) {
