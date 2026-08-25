@@ -66,14 +66,14 @@ find %{buildroot} -name '*.a' -delete
 %{_mandir}/man3/libknc.3*
 
 %changelog
-* Thu Aug 06 2026 ChapelTech <packages@chapel.tech> - 1.13-1
+* Thu Aug 06 2026 Roland C. Dowdeswell <elric@imrryr.org> - 1.13-1
 - Release 1.13.
 
-* Wed Aug 05 2026 ChapelTech <packages@chapel.tech> - 1.12-3
+* Wed Aug 05 2026 Roland C. Dowdeswell <elric@imrryr.org> - 1.12-3
 - Embed OpenPGP signatures in release RPMs.
 
-* Wed Aug 05 2026 ChapelTech <packages@chapel.tech> - 1.12-2
+* Wed Aug 05 2026 Roland C. Dowdeswell <elric@imrryr.org> - 1.12-2
 - Build against the Rocky MIT Kerberos implementation.
 
-* Thu Apr 30 2026 ChapelTech <packages@chapel.tech> - 1.12-1
+* Thu Apr 30 2026 Roland C. Dowdeswell <elric@imrryr.org> - 1.12-1
 - Add Rocky/RHEL packaging.
