@@ -60,12 +60,13 @@ void usage(void);
 
 int debug = 0;
 int quiet = 0;
+int transfer = 0;
 
 void
 usage(void)
 {
 
-	fprintf(stderr, "unit-simple [-d] service@hostname\n");
+	fprintf(stderr, "unit-simple [-dqx] service@hostname\n");
 	exit(EXIT_FAILURE);
 }
 
@@ -90,13 +91,16 @@ main(int argc, char **argv)
 	srandom(time(NULL));
  
         /* process arguments */
-	while ((c = getopt(argc, argv, POS "dq")) != -1) {
+	while ((c = getopt(argc, argv, POS "dqx")) != -1) {
 		switch (c) {
 		case 'd':
 			debug = 1;
 			break;
 		case 'q':
 			quiet = 1;
+			break;
+		case 'x':
+			transfer = 1;
 			break;
 		default:
 			usage();
@@ -174,6 +178,10 @@ int
 runserver(int fd)
 {
 	knc_ctx		ctx;
+	void		*token;
+	size_t		token_len;
+	unsigned	opts;
+	int		newfd;
 	uint32_t	offset;
 	uint32_t	len;
 	char		byte;
@@ -194,6 +202,32 @@ runserver(int fd)
 	if (knc_error(ctx)) {
 		fprintf(stderr, "S: knc_authenticate: %s\n", knc_errstr(ctx));
 		exit(1);
+	}
+
+	if (transfer) {
+		newfd = dup(fd);
+		if (newfd == -1) {
+			perror("S: dup");
+			exit(1);
+		}
+		if (knc_export_sec_context(ctx, &token, &token_len, &opts) == -1) {
+			fprintf(stderr, "S: knc_export_sec_context: %s\n",
+			    knc_errstr(ctx));
+			exit(1);
+		}
+		knc_ctx_destroy(ctx);
+
+		ctx = knc_ctx_init();
+		knc_set_debug(ctx, debug);
+		knc_set_debug_prefix(ctx, "S-imported");
+		knc_give_net_fd(ctx, newfd);
+		if (knc_import_sec_context(ctx, token, token_len, opts) == -1) {
+			fprintf(stderr, "S: knc_import_sec_context: %s\n",
+			    knc_errstr(ctx));
+			knc_release_exported_sec_context(token, token_len);
+			exit(1);
+		}
+		knc_release_exported_sec_context(token, token_len);
 	}
 
 	for (;;) {
