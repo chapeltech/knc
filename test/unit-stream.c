@@ -79,6 +79,36 @@ test_input_reuses_only_reachable_tail_space(void)
 }
 
 static void
+test_input_reuses_partial_tail_after_short_fill(void)
+{
+	void		*first;
+	void		*second;
+	stream_bit	 tail;
+	size_t		len;
+	knc_ctx		ctx;
+
+	ctx = knc_ctx_init();
+	check(ctx != NULL, "knc_ctx_init failed");
+
+	len = get_istream(&ctx->raw_send, &first, STREAM_BIT_ALLOC_UNIT);
+	check(len == STREAM_BIT_ALLOC_UNIT,
+	    "initial input reservation had the wrong size");
+	check(stream_fill(&ctx->raw_send, 1) == 1,
+	    "short input fill failed");
+	tail = ctx->raw_send.tail;
+
+	len = get_istream(&ctx->raw_send, &second, STREAM_BIT_ALLOC_UNIT);
+	check(len == STREAM_BIT_ALLOC_UNIT - 1,
+	    "partial input tail did not limit the next reservation");
+	check(ctx->raw_send.tail == tail,
+	    "short input fill allocated a new stream bit");
+	check(second == (char *)first + 1,
+	    "short input fill did not reuse adjacent tail space");
+
+	knc_ctx_destroy(ctx);
+}
+
+static void
 test_fill_reports_state_handler_failure(void)
 {
 	uint32_t	wirelen;
@@ -241,6 +271,7 @@ main(void)
 {
 
 	test_input_reuses_only_reachable_tail_space();
+	test_input_reuses_partial_tail_after_short_fill();
 	test_fill_reports_state_handler_failure();
 	test_cloexec_uses_descriptor_flags();
 	test_ostreamv_honours_vector_limit();

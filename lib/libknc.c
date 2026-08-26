@@ -631,7 +631,7 @@ get_istream(stream s, void **buf, size_t len)
 	if (s->cur && s->tail) {
 		remaining = s->tail->allocated - s->tail->len;
 
-		if (remaining >= len) {
+		if (remaining > 0) {
 			*buf = (void *)((char *)s->tail->buf + s->tail->len);
 			return MIN(len, remaining);
 		}
