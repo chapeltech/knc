@@ -25,6 +25,8 @@ REALM = "KNC.TEST"
 CLIENT_PRINC = "client@%s" % REALM
 SERVER_PRINC = "host/127.0.0.1@%s" % REALM
 ENCTYPE = "aes256-cts-hmac-sha1-96"
+CLIENT_PASSWORD = "knc-exec-client-password"
+MASTER_PASSWORD = "knc-exec-master-password"
 KNC_TIMEOUT = 20
 OUTPUT_LIMIT = 4096
 
@@ -225,6 +227,8 @@ class KNCExecTests(unittest.TestCase):
         cls.keytab = os.path.join(cls.tmpdir, "server.keytab")
         cls.ccache = os.path.join(cls.tmpdir, "client.ccache")
         cls.krb5_conf = os.path.join(cls.tmpdir, "krb5.conf")
+        cls.kdc_conf = os.path.join(cls.tmpdir, "kdc.conf")
+        cls.kdc = None
 
         if not os.path.exists(cls.client_knc):
             raise RuntimeError(
@@ -235,17 +239,38 @@ class KNCExecTests(unittest.TestCase):
 
         cls.ktutil = shutil.which("ktutil")
         cls.kimpersonate = shutil.which("kimpersonate")
-        if cls.ktutil is None:
-            raise MissingTool("ktutil not found")
-        if cls.kimpersonate is None:
-            raise MissingTool("kimpersonate not found")
+        use_kimpersonate = cls.ktutil is not None and cls.kimpersonate is not None
+
+        if use_kimpersonate:
+            kdc_port = None
+        else:
+            cls.kdb5_util = shutil.which("kdb5_util")
+            cls.kadmin_local = shutil.which("kadmin.local")
+            cls.krb5kdc = shutil.which("krb5kdc")
+            cls.kinit = shutil.which("kinit")
+            missing = [
+                name for name, path in (
+                    ("kdb5_util", cls.kdb5_util),
+                    ("kadmin.local", cls.kadmin_local),
+                    ("krb5kdc", cls.krb5kdc),
+                    ("kinit", cls.kinit),
+                ) if path is None
+            ]
+            if missing:
+                raise MissingTool(
+                    "kimpersonate or a local MIT KDC (%s)" %
+                    ", ".join(missing)
+                )
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.bind(("127.0.0.1", 0))
+                kdc_port = sock.getsockname()[1]
 
         with open(cls.helper, "w", encoding="utf-8") as f:
             f.write(textwrap.dedent(HELPER))
         os.chmod(cls.helper, 0o755)
 
         with open(cls.krb5_conf, "w", encoding="utf-8") as f:
-            f.write(textwrap.dedent("""\
+            config = textwrap.dedent("""\
                 [libdefaults]
                     default_realm = {realm}
                     dns_lookup_kdc = false
@@ -253,39 +278,125 @@ class KNCExecTests(unittest.TestCase):
                     rdns = false
                     dns_canonicalize_hostname = false
                     ticket_lifetime = 1h
-            """.format(realm=REALM)))
+            """.format(realm=REALM))
+            if kdc_port is not None:
+                config += textwrap.dedent("""\
+
+                    [realms]
+                        {realm} = {{
+                            kdc = 127.0.0.1:{port}
+                        }}
+                """.format(realm=REALM, port=kdc_port))
+            f.write(config)
+
+        if use_kimpersonate:
+            cls.run_checked([
+                cls.ktutil, "-k", cls.keytab, "add",
+                "--principal=%s" % SERVER_PRINC,
+                "--kvno=1",
+                "--enctype=%s" % ENCTYPE,
+                "--password=knc-exec-test-password",
+            ])
+            cls.run_checked([
+                cls.kimpersonate,
+                "--krb5",
+                "--client=%s" % CLIENT_PRINC,
+                "--server=%s" % SERVER_PRINC,
+                "--keytab=%s" % cls.keytab,
+                "--ccache=FILE:%s" % cls.ccache,
+                "--enc-type=%s" % ENCTYPE,
+                "--session-enc-type=%s" % ENCTYPE,
+            ])
+        else:
+            cls.start_local_kdc(kdc_port)
+
+    @classmethod
+    def start_local_kdc(cls, port):
+        database = os.path.join(cls.tmpdir, "principal")
+        with open(cls.kdc_conf, "w", encoding="utf-8") as f:
+            f.write(textwrap.dedent("""\
+                [kdcdefaults]
+                    kdc_ports = {port}
+                    kdc_tcp_ports = {port}
+
+                [realms]
+                    {realm} = {{
+                        database_name = {database}
+                        key_stash_file = {stash}
+                        acl_file = {acl}
+                    }}
+            """.format(
+                port=port,
+                realm=REALM,
+                database=database,
+                stash=os.path.join(cls.tmpdir, ".k5.%s" % REALM),
+                acl=os.path.join(cls.tmpdir, "kadm5.acl"),
+            )))
 
         cls.run_checked([
-            cls.ktutil, "-k", cls.keytab, "add",
-            "--principal=%s" % SERVER_PRINC,
-            "--kvno=1",
-            "--enctype=%s" % ENCTYPE,
-            "--password=knc-exec-test-password",
+            cls.kdb5_util, "create", "-s", "-P", MASTER_PASSWORD,
         ])
         cls.run_checked([
-            cls.kimpersonate,
-            "--krb5",
-            "--client=%s" % CLIENT_PRINC,
-            "--server=%s" % SERVER_PRINC,
-            "--keytab=%s" % cls.keytab,
-            "--ccache=FILE:%s" % cls.ccache,
-            "--enc-type=%s" % ENCTYPE,
-            "--session-enc-type=%s" % ENCTYPE,
+            cls.kadmin_local, "-q",
+            "addprinc -pw %s %s" % (CLIENT_PASSWORD, CLIENT_PRINC),
         ])
+        cls.run_checked([
+            cls.kadmin_local, "-q", "addprinc -randkey %s" % SERVER_PRINC,
+        ])
+        cls.run_checked([
+            cls.kadmin_local, "-q",
+            "ktadd -k %s -norandkey %s" % (cls.keytab, SERVER_PRINC),
+        ])
+
+        env = cls.krb5_env()
+        cls.kdc = subprocess.Popen(
+            [cls.krb5kdc, "-n"],
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        time.sleep(0.2)
+        if cls.kdc.poll() is not None:
+            stdout, stderr = cls.kdc.communicate()
+            raise RuntimeError(
+                "krb5kdc failed to start\nstdout:\n%s\nstderr:\n%s" %
+                (output_text(stdout), output_text(stderr))
+            )
+
+        cls.run_checked(
+            [cls.kinit, "-c", "FILE:%s" % cls.ccache, CLIENT_PRINC],
+            input_text=CLIENT_PASSWORD + "\n",
+        )
 
     @classmethod
     def tearDownClass(cls):
+        kdc = getattr(cls, "kdc", None)
+        if kdc is not None and kdc.poll() is None:
+            kdc.terminate()
+            try:
+                kdc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                kdc.kill()
+                kdc.wait()
         tmp = getattr(cls, "tmp", None)
         if tmp is not None:
             tmp.cleanup()
 
     @classmethod
-    def run_checked(cls, argv):
+    def krb5_env(cls):
         env = os.environ.copy()
         env["KRB5_CONFIG"] = cls.krb5_conf
+        env["KRB5_KDC_PROFILE"] = cls.kdc_conf
+        return env
+
+    @classmethod
+    def run_checked(cls, argv, input_text=None):
+        env = cls.krb5_env()
         proc = subprocess.run(
             argv,
             env=env,
+            input=input_text,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -1206,12 +1317,20 @@ def main():
     KNCExecTests.knc_path = args.knc
     KNCExecTests.client_knc_path = args.client_knc
     KNCExecTests.server_knc_path = args.server_knc
-    missing = [tool for tool in ("ktutil", "kimpersonate")
-               if shutil.which(tool) is None]
-    if missing:
-        print("missing optional test dependencies: %s" %
-              ", ".join(missing), file=sys.stderr)
-        return 1
+    have_kimpersonate = all(
+        shutil.which(tool) is not None for tool in ("ktutil", "kimpersonate")
+    )
+    local_kdc_tools = ("kdb5_util", "kadmin.local", "krb5kdc", "kinit")
+    missing_kdc_tools = [
+        tool for tool in local_kdc_tools if shutil.which(tool) is None
+    ]
+    if not have_kimpersonate and missing_kdc_tools:
+        print(
+            "missing optional test dependencies: kimpersonate or %s" %
+            ", ".join(missing_kdc_tools),
+            file=sys.stderr,
+        )
+        return 77
 
     if unittest_args:
         suite = unittest.defaultTestLoader.loadTestsFromNames(
