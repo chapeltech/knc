@@ -242,6 +242,87 @@ test_gss_buffer_ownership_on_error(void)
 	knc_ctx_destroy(ctx);
 }
 
+static knc_ctx
+negotiation_ctx(void)
+{
+	knc_ctx	ctx;
+
+	ctx = knc_ctx_init();
+	check(ctx != NULL, "knc_ctx_init failed");
+	knc_set_opt(ctx, KNC_OPT_COMPRESS_LZ4, 1);
+	return ctx;
+}
+
+static void
+test_lz4_ack_requires_request(void)
+{
+	knc_ctx	ctx;
+
+	ctx = negotiation_ctx();
+	check(cmd_compress_lz4_ok(ctx, 0, NULL, 0) < 0,
+	    "unsolicited LZ4 acknowledgement was accepted");
+	check(knc_error(ctx) == KNC_ERROR_PROTO,
+	    "unsolicited LZ4 acknowledgement was not a protocol error");
+	knc_ctx_destroy(ctx);
+}
+
+static void
+test_lz4_ack_cannot_restart_receive_stream(void)
+{
+	knc_ctx	ctx;
+
+	ctx = negotiation_ctx();
+	check(knc_queue_lz4_request(ctx) == 0,
+	    "failed to queue LZ4 request");
+	check(cmd_compress_lz4_ok(ctx, 0, NULL, 0) == 0,
+	    "valid LZ4 acknowledgement was rejected");
+	check(ctx->lz4_recv, "valid LZ4 acknowledgement was ignored");
+	check(cmd_compress_lz4_ok(ctx, 0, NULL, 0) < 0,
+	    "duplicate LZ4 acknowledgement was accepted");
+	check(knc_error(ctx) == KNC_ERROR_PROTO,
+	    "duplicate LZ4 acknowledgement was not a protocol error");
+	knc_ctx_destroy(ctx);
+}
+
+static void
+test_lz4_request_cannot_restart_send_stream(void)
+{
+	knc_ctx	ctx;
+
+	ctx = negotiation_ctx();
+	check(cmd_compress_lz4(ctx, 7, NULL, 0) == 0,
+	    "valid LZ4 request was rejected");
+	check(ctx->lz4_send_pending, "LZ4 acknowledgement was not pending");
+	check(cmd_compress_lz4(ctx, 7, NULL, 0) < 0,
+	    "duplicate LZ4 request was accepted");
+	check(knc_error(ctx) == KNC_ERROR_PROTO,
+	    "duplicate LZ4 request was not a protocol error");
+	knc_ctx_destroy(ctx);
+}
+
+static void
+test_lz4_negotiation_commands_reject_data(void)
+{
+	unsigned char	data = 0;
+	knc_ctx		ctx;
+
+	ctx = negotiation_ctx();
+	check(cmd_compress_lz4(ctx, 0, &data, sizeof(data)) < 0,
+	    "LZ4 request with data was accepted");
+	check(knc_error(ctx) == KNC_ERROR_PROTO,
+	    "LZ4 request data was not a protocol error");
+	knc_ctx_destroy(ctx);
+
+	ctx = negotiation_ctx();
+	check(knc_queue_lz4_request(ctx) == 0,
+	    "failed to queue LZ4 request");
+	check(cmd_compress_lz4_ok(ctx, 0, &data, sizeof(data)) < 0,
+	    "LZ4 acknowledgement with data was accepted");
+	check(knc_error(ctx) == KNC_ERROR_PROTO,
+	    "LZ4 acknowledgement data was not a protocol error");
+	knc_ctx_destroy(ctx);
+}
+
 int
 main(void)
 {
@@ -251,5 +332,9 @@ main(void)
 	test_trailing_frame();
 	test_decompression_backpressure();
 	test_gss_buffer_ownership_on_error();
+	test_lz4_ack_requires_request();
+	test_lz4_ack_cannot_restart_receive_stream();
+	test_lz4_request_cannot_restart_send_stream();
+	test_lz4_negotiation_commands_reject_data();
 	return 0;
 }

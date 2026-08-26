@@ -2691,7 +2691,10 @@ static int
 cmd_unknown(knc_ctx ctx, uint32_t cmdseqno, void *data, size_t len)
 {
 
-	knc_put_command(ctx, "dont_understand", cmdseqno, NULL, 0);
+	if (!knc_put_command(ctx, "dont_understand", cmdseqno, NULL, 0)) {
+		knc_enomem(ctx);
+		return -1;
+	}
 	return 0;
 }
 
@@ -2718,11 +2721,21 @@ cmd_compress_lz4(knc_ctx ctx, uint32_t cmdseqno, void *data, size_t len)
 {
 
 	if (!(ctx->opts & KNC_OPT_COMPRESS_LZ4)) {
-		cmd_unknown(ctx, cmdseqno, data, len);
-		return 0;
+		return cmd_unknown(ctx, cmdseqno, data, len);
+	}
+	if (len != 0) {
+		knc_proto_error(ctx, "LZ4 request contains data");
+		return -1;
+	}
+	if (ctx->lz4_send_pending || ctx->lz4_send) {
+		knc_proto_error(ctx, "Duplicate LZ4 request");
+		return -1;
 	}
 
-	knc_put_command(ctx, KNC_CMD_LZ4_ACK, cmdseqno, NULL, 0);
+	if (!knc_put_command(ctx, KNC_CMD_LZ4_ACK, cmdseqno, NULL, 0)) {
+		knc_enomem(ctx);
+		return -1;
+	}
 	ctx->lz4_send_pending = 1;
 	return 0;
 }
@@ -2732,15 +2745,23 @@ static int
 cmd_compress_lz4_ok(knc_ctx ctx, uint32_t cmdseqno, void *data, size_t len)
 {
 
-	if (ctx->opts & KNC_OPT_COMPRESS_LZ4) {
-		ctx->lz4_recv = 1;
-		ctx->lz4_recv_started = 0;
-		ctx->lz4_recv_finished = 0;
-		ctx->lz4_recv_drain_pending = 0;
-		ctx->lz4_recv_eof = 0;
-		if (knc_lz4_start_recv(ctx) < 0)
-			return -1;
+	if (len != 0) {
+		knc_proto_error(ctx, "LZ4 acknowledgement contains data");
+		return -1;
 	}
+	if (!(ctx->opts & KNC_OPT_COMPRESS_LZ4) ||
+	    !ctx->lz4_request_sent || ctx->lz4_recv) {
+		knc_proto_error(ctx, "Unexpected LZ4 acknowledgement");
+		return -1;
+	}
+
+	ctx->lz4_recv = 1;
+	ctx->lz4_recv_started = 0;
+	ctx->lz4_recv_finished = 0;
+	ctx->lz4_recv_drain_pending = 0;
+	ctx->lz4_recv_eof = 0;
+	if (knc_lz4_start_recv(ctx) < 0)
+		return -1;
 
 	return 0;
 }
@@ -2965,8 +2986,12 @@ knc_queue_capabilities(knc_ctx ctx)
 		return -1;
 	}
 
+	if (!knc_put_command(ctx, KNC_CMD_CAPABILITY, 0, buf,
+	    (uint32_t)len)) {
+		knc_enomem(ctx);
+		return -1;
+	}
 	ctx->capabilities_sent = 1;
-	knc_put_command(ctx, KNC_CMD_CAPABILITY, 0, buf, (uint32_t)len);
 	return 0;
 }
 
@@ -2981,8 +3006,11 @@ knc_queue_lz4_request(knc_ctx ctx)
 	if (ctx->lz4_request_sent || ctx->lz4_recv)
 		return 0;
 
+	if (!knc_put_command(ctx, KNC_CMD_LZ4_REQUEST, 0, NULL, 0)) {
+		knc_enomem(ctx);
+		return -1;
+	}
 	ctx->lz4_request_sent = 1;
-	knc_put_command(ctx, KNC_CMD_LZ4_REQUEST, 0, NULL, 0);
 	return 0;
 }
 
@@ -3210,7 +3238,8 @@ knc_state_process_out(knc_ctx ctx)
 
 	if (knc_queue_capabilities(ctx) < 0)
 		return -1;
-	knc_queue_lz4_request(ctx);
+	if (knc_queue_lz4_request(ctx) < 0)
+		return -1;
 
 	while (stream_avail(&ctx->cooked_send) < ctx->sendmax) {
 		if (knc_get_stream_bit_type(&ctx->sushi_send)) {
