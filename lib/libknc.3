@@ -382,6 +382,14 @@ particular
 .It KNC_OPT_NOPRIVACY boolean
 packets emitted will have cryptographically ensured integrity but will
 not be encrypted.
+.It KNC_OPT_ACCEPTOR_FIRST boolean
+causes
+.Fn knc_accept
+to perform one
+.Fn gss_accept_sec_context
+step with an empty input token.
+This allows mechanisms which can emit an acceptor-side initial token to
+queue that token before reading from the peer.
 .It KNC_SOCK_NONBLOCK boolean
 the network socket will be set to non-blocking mode and 
 .Fn knc_read ,

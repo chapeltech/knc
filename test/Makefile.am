@@ -5,8 +5,11 @@ LDADD = ../lib/libknc.la
 
 bin_PROGRAMS = unit unit-simple testknc servefile
 
-check_PROGRAMS = unit-stream
-TESTS = unit-stream
+check_PROGRAMS = unit-stream unit-accept
+TESTS = unit-stream unit-accept
+
+unit_accept_SOURCES = unit-accept.c
+unit_accept_LDADD = $(GSSAPI_LIBS)
 
 unit_stream_SOURCES = unit-stream.c
 unit_stream_LDADD = $(GSSAPI_LIBS)

@@ -1126,6 +1126,7 @@ knc_get_opt(knc_ctx ctx, unsigned opt)
 
 	switch (opt) {
 	case KNC_OPT_NOPRIVACY:
+	case KNC_OPT_ACCEPTOR_FIRST:
 	case KNC_SOCK_NONBLOCK:
 	case KNC_SOCK_CLOEXEC:
 		return (ctx->opts & opt) ? 1 : 0;
@@ -1155,6 +1156,7 @@ knc_set_opt(knc_ctx ctx, unsigned opt, int value)
 	/* We handle all of the flag-options together: */
 	case KNC_OPT_NOPRIVACY:
 	case KNC_OPT_SENDCMDS:
+	case KNC_OPT_ACCEPTOR_FIRST:
 	case KNC_SOCK_NONBLOCK:
 	case KNC_SOCK_CLOEXEC:
 		if (value)
@@ -1438,6 +1440,9 @@ knc_accept(knc_ctx ctx)
 
 	ctx->gssctx = GSS_C_NO_CONTEXT;
 	ctx->state  = STATE_ACCEPT;
+
+	if (ctx->opts & KNC_OPT_ACCEPTOR_FIRST)
+		knc_state_accept(ctx, NULL, 0);
 }
 
 static int
