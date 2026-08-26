@@ -165,6 +165,35 @@ test_ostreamv_honours_vector_limit(void)
 }
 
 static void
+test_contiguous_output_stops_at_command(void)
+{
+	const char	 data[] = "payload";
+	unsigned char	 command = 0;
+	void		*buf;
+	knc_ctx		 ctx;
+	size_t		 len;
+
+	ctx = knc_ctx_init();
+	check(ctx != NULL, "knc_ctx_init failed");
+	check(put_stream(&ctx->raw_send, data, sizeof(data)) == sizeof(data),
+	    "data put_stream failed");
+	check(put_stream_command(&ctx->raw_send, &command, sizeof(command)) ==
+	    sizeof(command), "command put_stream failed");
+
+	len = get_ostream_contig(&ctx->raw_send, &buf, sizeof(data) + 1);
+	check(len == sizeof(data),
+	    "get_ostream_contig crossed a command boundary");
+	check(memcmp(buf, data, sizeof(data)) == 0,
+	    "get_ostream_contig corrupted data before a command");
+	check(stream_drain(&ctx->raw_send, len) == (ssize_t)len,
+	    "data stream drain failed");
+	check(knc_get_stream_bit_type(&ctx->raw_send) == STREAM_COMMAND,
+	    "command was not preserved after data drain");
+
+	knc_ctx_destroy(ctx);
+}
+
+static void
 test_pollfds_accepts_fd_zero_and_exact_capacity(void)
 {
 	knc_callback	cbs[1];
@@ -245,6 +274,7 @@ main(void)
 	test_fill_reports_state_handler_failure();
 	test_cloexec_uses_descriptor_flags();
 	test_ostreamv_honours_vector_limit();
+	test_contiguous_output_stops_at_command();
 	test_pollfds_accepts_fd_zero_and_exact_capacity();
 	test_large_command_uses_exact_storage();
 

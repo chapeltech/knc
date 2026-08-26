@@ -811,15 +811,20 @@ static size_t
 get_ostream_contig(stream s, void **buf, size_t len)
 {
 	stream_bit	cur;
+	int		type;
 	size_t		retlen;
 	size_t		tmplen;
 
 	if (!s || !s->cur)
 		return 0;
 
-	/* We adjust len down to the available bytes */
+	/* Commands are stream boundaries, not bytes in the adjacent buffer. */
 
-	tmplen = stream_avail(s);
+	type = s->cur->type;
+	tmplen = s->cur->len - s->bufpos;
+	for (cur = s->cur->next; cur && cur->type == type;
+	    cur = cur->next)
+		tmplen += cur->len;
 	len = MIN(tmplen, len);
 
 	/*
@@ -849,15 +854,12 @@ get_ostream_contig(stream s, void **buf, size_t len)
 	memcpy(*buf, (char *)cur->buf + s->bufpos, retlen);
 	cur = cur->next;
 
-	while (retlen < len) {
+	while (retlen < len && cur && cur->type == type) {
 		tmplen = MIN(len - retlen, cur->len);
 		memcpy((char *)*buf + retlen, cur->buf, tmplen);
 
 		cur = cur->next;
 		retlen += tmplen;
-
-		if (!cur || cur->type != STREAM_BUFFER)
-			break;
 	}
 
 	return retlen;
