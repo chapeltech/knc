@@ -1,7 +1,7 @@
 
 ACLOCAL_AMFLAGS = -I cf
 
-SUBDIRS  = bin lib test
+SUBDIRS  = lib bin test
 
 EXTRA_DIST = \
 	contrib/systemd/README \
