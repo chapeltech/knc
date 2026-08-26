@@ -173,3 +173,12 @@ Acceptance criteria:
 - [x] Make the libknc-backed executable pass executable tests.
 - [x] Flip installed `knc` to libknc.
 - [ ] Remove legacy executable GSS transport code.
+
+## 8. Send Path Optimisation
+
+- [ ] Investigate GSS IOV wrapping for the send path.  Start with
+  `gss_wrap_iov()`/`gss_wrap_iov_length()` so `sushi_send` buffers can be
+  encrypted in-place and written with `writev(2)` rather than copied through a
+  contiguous `gss_wrap()` token.  Consider `gss_unwrap_iov()` separately after
+  the stream ownership rules are clear.  Keep the existing GSS APIs as fallback
+  for implementations without the IOV extension.
