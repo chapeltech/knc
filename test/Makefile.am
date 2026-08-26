@@ -5,11 +5,12 @@ LDADD = ../lib/libknc.la
 
 bin_PROGRAMS = unit unit-simple testknc servefile
 noinst_PROGRAMS = benchio
-check_PROGRAMS = unit-stream unit-pollfds unit-eof
+check_PROGRAMS = unit-stream unit-pollfds unit-eof unit-lz4
 TEST_EXTENSIONS = .py
 PY_LOG_COMPILER = python3
 TESTS_ENVIRONMENT = KNC=$(abs_top_builddir)/bin/knc
-TESTS = unit-stream unit-pollfds unit-eof knc-handshake-timeout.py
+TESTS = unit-stream unit-pollfds unit-eof unit-lz4 \
+    knc-handshake-timeout.py
 
 benchio_SOURCES = benchio.c
 benchio_LDADD =
@@ -19,10 +20,13 @@ unit_pollfds_SOURCES = unit-pollfds.c ../lib/lz4.c ../lib/lz4frame.c \
     ../lib/lz4hc.c ../lib/xxhash.c
 unit_eof_SOURCES = unit-eof.c ../lib/lz4.c ../lib/lz4frame.c \
     ../lib/lz4hc.c ../lib/xxhash.c
+unit_lz4_SOURCES = unit-lz4.c ../lib/lz4.c ../lib/lz4frame.c \
+    ../lib/lz4hc.c ../lib/xxhash.c
 
 unit_stream_LDADD = $(GSSAPI_LIBS)
 unit_pollfds_LDADD = $(GSSAPI_LIBS)
 unit_eof_LDADD = $(GSSAPI_LIBS)
+unit_lz4_LDADD = $(GSSAPI_LIBS)
 
 EXTRA_DIST = knc-exec-tests.py knc-bench.py knc-handshake-timeout.py \
     knc-throughput-bench.py

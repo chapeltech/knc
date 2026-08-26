@@ -164,6 +164,10 @@ struct internal_knc_ctx {
 	int			 lz4_send_started;
 	int			 lz4_send_ended;
 	int			 lz4_flush_pending;
+	int			 lz4_recv_started;
+	int			 lz4_recv_finished;
+	int			 lz4_recv_drain_pending;
+	int			 lz4_recv_eof;
 	LZ4F_compressionContext_t lz4_send_ctx;
 	LZ4F_decompressionContext_t lz4_recv_ctx;
 	int			 capabilities_sent;
@@ -290,6 +294,7 @@ static size_t	knc_effective_wrap_input_limit(knc_ctx, size_t);
 static int	knc_probe_max_recv_packet(knc_ctx);
 static int	knc_put_unwrapped_data(knc_ctx, gss_buffer_t);
 static int	knc_process_sushi_recv(knc_ctx);
+static void	knc_lz4_mark_recv_eof(knc_ctx);
 static int	knc_lz4_start_send(knc_ctx);
 static int	knc_lz4_compress_data(knc_ctx, void *, size_t);
 static int	knc_lz4_flush_send(knc_ctx);
@@ -551,6 +556,7 @@ static size_t
 put_stream_gssbuf(stream s, gss_buffer_t inbuf)
 {
 	gss_buffer_t	buf;
+	size_t		ret;
 
 	buf = calloc(1, sizeof(*buf));
 	if (!buf)
@@ -560,8 +566,10 @@ put_stream_gssbuf(stream s, gss_buffer_t inbuf)
 	buf->value  = inbuf->value;
 	buf->length = inbuf->length;
 
-	return put_stream_userbuf(s, buf->value, buf->length, free_gssbuf,
-	    buf);
+	ret = put_stream_userbuf(s, buf->value, buf->length, free_gssbuf, buf);
+	if (ret != buf->length)
+		free(buf);
+	return ret;
 }
 
 struct mmapregion {
@@ -1661,6 +1669,10 @@ knc_set_opt(knc_ctx ctx, unsigned opt, int value)
 			ctx->lz4_send_started = 0;
 			ctx->lz4_send_ended = 0;
 			ctx->lz4_flush_pending = 0;
+			ctx->lz4_recv_started = 0;
+			ctx->lz4_recv_finished = 0;
+			ctx->lz4_recv_drain_pending = 0;
+			ctx->lz4_recv_eof = 0;
 			LZ4F_freeCompressionContext(ctx->lz4_send_ctx);
 			LZ4F_freeDecompressionContext(ctx->lz4_recv_ctx);
 			ctx->lz4_send_ctx = NULL;
@@ -2324,21 +2336,34 @@ knc_state_accept(knc_ctx ctx, void *buf, size_t len)
 static int
 knc_put_unwrapped_data(knc_ctx ctx, gss_buffer_t out)
 {
+	size_t	len;
 
 	if (!(ctx->open & OPEN_READ)) {
 		knc_proto_error(ctx, "Data after EOF");
 		return -1;
 	}
 
+	len = out->length;
 	if (ctx->lz4_recv) {
-		if (put_stream_gssbuf(&ctx->sushi_recv, out) != out->length) {
+		if (ctx->lz4_recv_finished) {
+			knc_proto_error(ctx, "LZ4 data after compression end");
+			return -1;
+		}
+		if (put_stream_gssbuf(&ctx->sushi_recv, out) != len) {
 			knc_enomem(ctx);
 			return -1;
 		}
+		out->value = NULL;
+		out->length = 0;
 		return knc_process_sushi_recv(ctx);
 	}
 
-	put_stream_gssbuf(&ctx->cooked_recv, out);
+	if (put_stream_gssbuf(&ctx->cooked_recv, out) != len) {
+		knc_enomem(ctx);
+		return -1;
+	}
+	out->value = NULL;
+	out->length = 0;
 	return 0;
 }
 
@@ -2365,6 +2390,7 @@ knc_process_sushi_recv(knc_ctx ctx)
 	size_t			 insize;
 	size_t			 outsize;
 	size_t			 ret;
+	size_t			 room;
 
 	if (!ctx->lz4_recv)
 		return 0;
@@ -2373,12 +2399,31 @@ knc_process_sushi_recv(knc_ctx ctx)
 		return -1;
 
 	for (;;) {
+		if (ctx->lz4_recv_finished) {
+			if (stream_avail(&ctx->sushi_recv) != 0) {
+				knc_proto_error(ctx,
+				    "LZ4 data after compression end");
+				return -1;
+			}
+			return 0;
+		}
+
+		if (stream_avail(&ctx->cooked_recv) >= ctx->recvinbufsiz)
+			return 0;
+		room = ctx->recvinbufsiz - stream_avail(&ctx->cooked_recv);
+
+		src = NULL;
 		srclen = get_ostream(&ctx->sushi_recv, &src,
 		    stream_avail(&ctx->sushi_recv));
-		if (srclen < 1)
+		if (srclen < 1 && !ctx->lz4_recv_drain_pending) {
+			if (ctx->lz4_recv_eof && ctx->lz4_recv_started) {
+				knc_proto_error(ctx, "Truncated LZ4 frame");
+				return -1;
+			}
 			return 0;
+		}
 
-		dstlen = KNC_LZ4_OUTPUT_CHUNK;
+		dstlen = MIN(KNC_LZ4_OUTPUT_CHUNK, room);
 		dst = malloc(dstlen);
 		if (!dst) {
 			knc_enomem(ctx);
@@ -2387,6 +2432,9 @@ knc_process_sushi_recv(knc_ctx ctx)
 
 		insize = srclen;
 		outsize = dstlen;
+		ctx->lz4_recv_drain_pending = 0;
+		if (srclen > 0)
+			ctx->lz4_recv_started = 1;
 		memset(&opts, 0, sizeof(opts));
 		ret = LZ4F_decompress(ctx->lz4_recv_ctx, dst, &outsize,
 		    src, &insize, &opts);
@@ -2397,6 +2445,8 @@ knc_process_sushi_recv(knc_ctx ctx)
 
 		if (insize > 0)
 			stream_drain(&ctx->sushi_recv, insize);
+		if (ret == 0)
+			ctx->lz4_recv_finished = 1;
 
 		if (outsize > 0) {
 			if (put_malloc_stream(ctx, &ctx->cooked_recv, dst,
@@ -2405,14 +2455,37 @@ knc_process_sushi_recv(knc_ctx ctx)
 		} else
 			free(dst);
 
-		if (insize == 0 && outsize == 0)
-			return 0;
+		if (ret != 0 && outsize == dstlen &&
+		    stream_avail(&ctx->sushi_recv) == 0)
+			ctx->lz4_recv_drain_pending = 1;
 
-		if (stream_avail(&ctx->sushi_recv) == 0)
+		if (insize == 0 && outsize == 0) {
+			if (ctx->lz4_recv_eof && ctx->lz4_recv_started) {
+				knc_proto_error(ctx, "Truncated LZ4 frame");
+				return -1;
+			}
 			return 0;
+		}
+
+		if (ctx->lz4_recv_finished &&
+		    stream_avail(&ctx->sushi_recv) != 0) {
+			knc_proto_error(ctx, "LZ4 data after compression end");
+			return -1;
+		}
 	}
 
 	return 0;
+}
+
+static void
+knc_lz4_mark_recv_eof(knc_ctx ctx)
+{
+
+	if (!ctx->lz4_recv)
+		return;
+
+	ctx->lz4_recv_eof = 1;
+	knc_process_sushi_recv(ctx);
 }
 
 static int
@@ -2661,7 +2734,12 @@ cmd_compress_lz4_ok(knc_ctx ctx, uint32_t cmdseqno, void *data, size_t len)
 
 	if (ctx->opts & KNC_OPT_COMPRESS_LZ4) {
 		ctx->lz4_recv = 1;
-		knc_lz4_start_recv(ctx);
+		ctx->lz4_recv_started = 0;
+		ctx->lz4_recv_finished = 0;
+		ctx->lz4_recv_drain_pending = 0;
+		ctx->lz4_recv_eof = 0;
+		if (knc_lz4_start_recv(ctx) < 0)
+			return -1;
 	}
 
 	return 0;
@@ -2782,6 +2860,7 @@ knc_state_command(knc_ctx ctx, void *buf, size_t len)
 	uint32_t	 cmdbuflen;
 	size_t		 remainlen;
 	int		 conf_state = 0;
+	int		 ret = 0;
 
 	in.value  = buf;
 	in.length = len;
@@ -2851,7 +2930,10 @@ knc_state_command(knc_ctx ctx, void *buf, size_t len)
 			goto done;
 		}
 
-		cmd(ctx, cmdseqno, cmdbuf, cmdbuflen);
+		if (cmd(ctx, cmdseqno, cmdbuf, cmdbuflen) < 0) {
+			ret = -1;
+			goto done;
+		}
 
 		cmdbuf    += cmdbuflen;
 		remainlen -= (const char *)cmdbuf - (const char *)oldptr;
@@ -2859,7 +2941,7 @@ knc_state_command(knc_ctx ctx, void *buf, size_t len)
 
 done:
 	gss_release_buffer(&min, &out);
-	return 0;
+	return ret;
 }
 
 static int
@@ -2968,6 +3050,7 @@ knc_discard_empty_input(knc_ctx ctx, int dir)
 static void
 knc_remote_read_eof(knc_ctx ctx)
 {
+	knc_lz4_mark_recv_eof(ctx);
 
 	ctx->open &= ~OPEN_READ;
 
@@ -3025,6 +3108,7 @@ knc_local_write_eof(knc_ctx ctx)
 static void
 knc_network_read_eof(knc_ctx ctx)
 {
+	knc_lz4_mark_recv_eof(ctx);
 
 	ctx->open &= ~OPEN_READ;
 
@@ -3400,6 +3484,8 @@ knc_pending(knc_ctx ctx, int dir)
 			ret++;
 	} else {
 		ret += stream_avail(&ctx->sushi_recv);
+		if (ctx->lz4_recv_drain_pending)
+			ret++;
 	}
 
 	return ret;
@@ -4228,8 +4314,11 @@ knc_flush(knc_ctx ctx, int dir, size_t flushlen)
 	/* XXXrcd: deal with ctx->open */
 
 	for (;;) {
-		if (dir == KNC_DIR_SEND)
-			knc_state_process_out(ctx);
+		if (dir == KNC_DIR_SEND) {
+			if (knc_state_process_out(ctx) < 0)
+				return EIO;
+		} else if (knc_process_sushi_recv(ctx) < 0)
+			return EIO;
 
 		len = knc_get_obufv(ctx, dir, MAX_IOVCNT, &vec, &iovcnt);
 		if (len <= 0)
