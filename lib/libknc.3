@@ -20,7 +20,7 @@
 .\" CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 .\" WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 .\"
-.Dd September 8, 2010
+.Dd August 26, 2026
 .Dt LIBKNC 3
 .Os
 .Sh NAME
@@ -402,6 +402,13 @@ particular
 .It KNC_OPT_NOPRIVACY boolean
 packets emitted will have cryptographically ensured integrity but will
 not be encrypted.
+.It KNC_OPT_COMPRESS_LZ4 boolean
+requests LZ4 framed compression of application stream data.
+Compression is negotiated independently in each direction and starts only
+after the peer acknowledges the request.
+KNC command packets remain outside the compressed stream.
+Both peer contexts must enable this option because the command framing used
+for negotiation is not compatible with legacy peers.
 .It KNC_SOCK_NONBLOCK boolean
 the network socket will be set to non-blocking mode and 
 .Fn knc_read ,
@@ -445,6 +452,7 @@ Peers that do not advertise this capability are treated as supporting
 only the legacy 64KB packet size.
 Setting this option above the legacy size enables command packets so
 that the capability can be sent.
+The advertised value is capped at the 1 MiB wire-frame limit.
 .It KNC_OPT_MAX_SEND_PACKET int
 sets the maximum plaintext packet size that this context will try to
 hand to

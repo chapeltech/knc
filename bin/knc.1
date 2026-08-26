@@ -20,7 +20,7 @@
 .\" ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF
 .\" CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 .\" WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-.Dd July 24, 2007
+.Dd August 26, 2026
 .Os
 .Dt KNC 1
 .Sh NAME
@@ -129,6 +129,24 @@ enables TCP keepalives.
 .It Ar handshake-timeout=seconds
 sets the maximum time allowed for an incoming authentication exchange.
 The default is 60 seconds.
+.It Ar lz4
+enables LZ4 framed compression of application stream data.
+Compression is negotiated independently in each direction and begins only
+after the peer acknowledges the request.
+Command packets are not compressed.
+This option must be enabled on both endpoints because legacy peers do not
+recognise the command framing used for negotiation.
+.It Ar max-packet=size
+sets the preferred maximum outgoing plaintext packet size and advertises
+the maximum incoming wire packet size to the peer.
+The size may use a
+.Cm K ,
+.Cm M ,
+or
+.Cm G
+suffix, optionally followed by
+.Cm B .
+On-the-wire packets remain limited to 1 MiB.
 .It Ar no-half-close
 disable the half close functionality.
 .It Ar noprivacy
