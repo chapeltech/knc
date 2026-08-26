@@ -110,6 +110,30 @@ test_max_recv_packet_option_enables_commands(void)
 }
 
 static void
+test_max_recv_packet_is_capped_at_wire_limit(void)
+{
+	char	 cap[64];
+	knc_ctx	 ctx;
+	int	 len;
+
+	ctx = knc_ctx_init();
+	check(ctx != NULL, "knc_ctx_init failed");
+	knc_set_opt(ctx, KNC_OPT_MAX_RECV_PACKET, INT_MAX);
+	check(knc_get_opt(ctx, KNC_OPT_MAX_RECV_PACKET) == KNC_MAX_WIRELEN,
+	    "local max receive packet exceeded wire limit");
+
+	len = snprintf(cap, sizeof(cap), "max_recv_packet=%zu\n",
+	    (size_t)KNC_MAX_WIRELEN + 1);
+	check(len > 0 && (size_t)len < sizeof(cap),
+	    "peer max receive capability did not fit");
+	cmd_capability(ctx, 0, cap, (size_t)len);
+	check(ctx->peer_max_recv_packet == KNC_MAX_WIRELEN,
+	    "peer max receive packet exceeded wire limit");
+
+	knc_ctx_destroy(ctx);
+}
+
+static void
 test_capability_command_updates_peer_recv_limit(void)
 {
 	knc_ctx		ctx;
@@ -592,6 +616,7 @@ main(void)
 
 	test_no_half_close_option();
 	test_max_recv_packet_option_enables_commands();
+	test_max_recv_packet_is_capped_at_wire_limit();
 	test_capability_command_updates_peer_recv_limit();
 	test_read_packet_accepts_grace_over_local_recv_limit();
 	test_read_packet_rejects_beyond_local_recv_limit_grace();

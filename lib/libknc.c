@@ -1640,7 +1640,8 @@ knc_set_opt(knc_ctx ctx, unsigned opt, int value)
 
 	case KNC_OPT_MAX_RECV_PACKET:
 		if (value > KNC_DEFAULT_MAX_RECV_PACKET) {
-			ctx->local_max_recv_packet = value;
+			ctx->local_max_recv_packet = MIN((size_t)value,
+			    KNC_MAX_WIRELEN);
 			ctx->opts |= KNC_OPT_SENDCMDS;
 			ctx->capabilities_sent = 0;
 		}
@@ -2648,6 +2649,7 @@ process_capability(knc_ctx ctx, const char *buf, size_t len)
 	if (len > keylen && memcmp(buf, max_recv_packet, keylen) == 0) {
 		if (!parse_size_t_decimal(buf + keylen, len - keylen, &value))
 			return;
+		value = MIN(value, KNC_MAX_WIRELEN);
 		if (value > ctx->peer_max_recv_packet)
 			ctx->peer_max_recv_packet = value;
 	}
