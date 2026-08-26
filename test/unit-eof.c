@@ -54,6 +54,25 @@ check_no_error(knc_ctx ctx, const char *message)
 	}
 }
 
+struct read_expectation {
+	size_t		 len;
+	int		 calls;
+	int		 fill;
+	const char	*message;
+};
+
+static ssize_t
+read_expected_len(void *cookie, void *buf, size_t len)
+{
+	struct read_expectation	*r = cookie;
+
+	check(len == r->len, r->message);
+	memset(buf, r->fill, len);
+	r->calls++;
+
+	return (ssize_t)len;
+}
+
 static void
 test_no_half_close_option(void)
 {
@@ -186,6 +205,104 @@ test_read_packet_rejects_beyond_local_recv_limit_grace(void)
 	    "oversized packet was not a protocol error");
 
 	knc_ctx_destroy(ctx);
+}
+
+static void
+test_max_send_packet_option_grows_fill_buffer(void)
+{
+	struct read_expectation	 r;
+	size_t			 max_packet;
+	void			*buf;
+	knc_ctx			 ctx;
+
+	max_packet = KNC_DEFAULT_MAX_RECV_PACKET * 4;
+	r.len = max_packet;
+	r.calls = 0;
+	r.fill = 0xa5;
+	r.message = "max send packet did not control local read size";
+
+	ctx = knc_ctx_init();
+	check(ctx != NULL, "knc_ctx_init failed");
+
+	check(knc_get_ibuf(ctx, KNC_DIR_SEND, &buf, 1) == 1,
+	    "initial send buffer reservation failed");
+	check(knc_fill_buf(ctx, KNC_DIR_SEND, 1) == 1,
+	    "initial send buffer fill failed");
+
+	knc_set_opt(ctx, KNC_OPT_MAX_SEND_PACKET, (int)max_packet);
+	ctx->localread = read_expected_len;
+	ctx->localcookie = &r;
+
+	check(knc_fill(ctx, KNC_DIR_SEND) == 0,
+	    "max send packet fill returned an error");
+	check(r.calls == 1, "max send packet read was not called");
+	check(stream_avail(&ctx->raw_send) == max_packet + 1,
+	    "max send packet data was not buffered");
+	check(ctx->raw_send.tail->len == max_packet,
+	    "max send packet read did not fill a new stream bit");
+	check(ctx->raw_send.tail->allocated >= max_packet,
+	    "max send packet stream bit was too small");
+
+	knc_ctx_destroy(ctx);
+}
+
+static void
+test_max_recv_packet_option_grows_fill_buffer(void)
+{
+	struct read_expectation	 r;
+	size_t			 max_packet;
+	knc_ctx			 ctx;
+
+	max_packet = KNC_DEFAULT_MAX_RECV_PACKET * 4;
+	r.len = max_packet + sizeof(uint32_t);
+	r.calls = 0;
+	r.fill = 0;
+	r.message = "max recv packet did not control network read size";
+
+	ctx = knc_ctx_init();
+	check(ctx != NULL, "knc_ctx_init failed");
+
+	knc_set_opt(ctx, KNC_OPT_MAX_RECV_PACKET, (int)max_packet);
+	ctx->netread = read_expected_len;
+	ctx->netcookie = &r;
+
+	check(knc_fill(ctx, KNC_DIR_RECV) == 0,
+	    "max recv packet fill returned an error");
+	check_no_error(ctx, "max recv packet fill set an error");
+	check(r.calls == 1, "max recv packet read was not called");
+
+	knc_ctx_destroy(ctx);
+}
+
+static void
+test_large_put_buf_uses_bounded_stream_bits(void)
+{
+	stream_bit	 bit;
+	size_t		 max_packet;
+	size_t		 bits;
+	char		*payload;
+	knc_ctx		 ctx;
+
+	max_packet = KNC_DEFAULT_MAX_RECV_PACKET * 4;
+	payload = calloc(1, max_packet);
+	check(payload != NULL, "calloc failed");
+
+	ctx = knc_ctx_init();
+	check(ctx != NULL, "knc_ctx_init failed");
+
+	check(knc_put_buf(ctx, KNC_DIR_SEND, payload, max_packet) ==
+	    max_packet, "large put buffer failed");
+
+	bits = 0;
+	for (bit = ctx->raw_send.cur; bit != NULL; bit = bit->next) {
+		check(bit->allocated <= STREAM_BIT_ALLOC_MAX,
+		    "large put buffer allocated an oversized stream bit");
+		bits++;
+	}
+	check(bits > 1, "large put buffer was not chunked");
+
+	knc_ctx_destroy(ctx);
+	free(payload);
 }
 
 static void
@@ -595,6 +712,9 @@ main(void)
 	test_capability_command_updates_peer_recv_limit();
 	test_read_packet_accepts_grace_over_local_recv_limit();
 	test_read_packet_rejects_beyond_local_recv_limit_grace();
+	test_max_send_packet_option_grows_fill_buffer();
+	test_max_recv_packet_option_grows_fill_buffer();
+	test_large_put_buf_uses_bounded_stream_bits();
 	test_local_read_eof_does_not_queue_command_by_default();
 	test_local_read_eof_queues_send_eof_with_commands();
 	test_no_half_close_local_read_eof_closes_both_sides_by_default();

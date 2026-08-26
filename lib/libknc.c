@@ -95,6 +95,7 @@ struct stream_gc {
 };
 
 #define STREAM_BIT_ALLOC_UNIT	(64 * 1024)
+#define STREAM_BIT_ALLOC_MAX	(2 * STREAM_BIT_ALLOC_UNIT)
 #define NUM_STREAM_BITS	31
 #define NUM_STREAM_BUFS	4
 
@@ -255,6 +256,7 @@ static stream_bit	 get_stream_bit(stream);
 static void		 rel_stream_bit(stream, stream_bit);
 static void		*get_stream_buf(stream, size_t);
 static void		 rel_stream_buf(stream, void *);
+static stream_bit	 alloc_stream_bit_max(stream, int, size_t, size_t);
 static stream_bit	 alloc_stream_bit(stream, int, size_t);
 static size_t		 append_stream_bit(stream, stream_bit);
 
@@ -262,6 +264,7 @@ static size_t	put_stream(stream, const void *, size_t);
 static size_t	put_stream_userbuf(stream, void *, size_t,
 		    void (*)(void *, void *), void *);
 static size_t	put_stream_gssbuf(stream, gss_buffer_t);
+static size_t	get_istream_max(stream, void **, size_t, size_t);
 static size_t	get_istream(stream, void **, size_t);
 static size_t	get_ostream(stream, void **, size_t);
 static size_t	get_ostreamv(stream, int, struct iovec **, int *);
@@ -435,13 +438,23 @@ append_stream_bit(stream s, stream_bit b)
 }
 
 static stream_bit
-alloc_stream_bit(stream s, int type, size_t len)
+alloc_stream_bit_max(stream s, int type, size_t len, size_t max)
 {
 	stream_bit	 bit;
 
-	len  = len / STREAM_BIT_ALLOC_UNIT + (len % STREAM_BIT_ALLOC_UNIT)?1:0;
-	len *= STREAM_BIT_ALLOC_UNIT;
-	len  = MIN((2 * STREAM_BIT_ALLOC_UNIT), len);
+	if (max < STREAM_BIT_ALLOC_UNIT)
+		max = STREAM_BIT_ALLOC_UNIT;
+
+	len = MIN(len, max);
+	if (len < STREAM_BIT_ALLOC_UNIT)
+		len = STREAM_BIT_ALLOC_UNIT;
+	else {
+		if (len <= SIZE_MAX - (STREAM_BIT_ALLOC_UNIT - 1))
+			len = ((len + STREAM_BIT_ALLOC_UNIT - 1) /
+			    STREAM_BIT_ALLOC_UNIT) * STREAM_BIT_ALLOC_UNIT;
+		if (len > max)
+			len = max;
+	}
 
 	bit = get_stream_bit(s);
 	if (!bit)
@@ -458,6 +471,13 @@ alloc_stream_bit(stream s, int type, size_t len)
 	}
 
 	return bit;
+}
+
+static stream_bit
+alloc_stream_bit(stream s, int type, size_t len)
+{
+
+	return alloc_stream_bit_max(s, type, len, STREAM_BIT_ALLOC_MAX);
 }
 
 static size_t
@@ -647,7 +667,7 @@ knc_get_stream_command(stream s, size_t *len)
 }
 
 static size_t
-get_istream(stream s, void **buf, size_t len)
+get_istream_max(stream s, void **buf, size_t len, size_t max)
 {
 	stream_bit	tmp;
 	size_t		remaining;
@@ -657,7 +677,7 @@ get_istream(stream s, void **buf, size_t len)
 		return 0;
 	}
 
-	if (s->tail) {
+	if (s->cur && s->tail) {
 		remaining = s->tail->allocated - s->tail->len;
 
 		if (remaining >= len) {
@@ -666,7 +686,11 @@ get_istream(stream s, void **buf, size_t len)
 		}
 	}
 
-	tmp = alloc_stream_bit(s, STREAM_BUFFER, len);
+	/*
+	 * Ordinary callers stay bounded by STREAM_BIT_ALLOC_MAX.  Descriptor
+	 * reads can pass a larger max after packet-size negotiation.
+	 */
+	tmp = alloc_stream_bit_max(s, STREAM_BUFFER, len, max);
 	if (!tmp)
 		return 0;
 
@@ -674,6 +698,13 @@ get_istream(stream s, void **buf, size_t len)
 
 	*buf = tmp->buf;
 	return MIN(len, tmp->allocated);
+}
+
+static size_t
+get_istream(stream s, void **buf, size_t len)
+{
+
+	return get_istream_max(s, buf, len, STREAM_BIT_ALLOC_MAX);
 }
 
 /*
@@ -1543,6 +1574,7 @@ knc_set_opt(knc_ctx ctx, unsigned opt, int value)
 {
 	int	rfd;
 	int	wfd;
+	size_t	packet_read_size;
 
 	if (!ctx)
 		return;
@@ -1572,14 +1604,24 @@ knc_set_opt(knc_ctx ctx, unsigned opt, int value)
 	case KNC_OPT_MAX_RECV_PACKET:
 		if (value > KNC_DEFAULT_MAX_RECV_PACKET) {
 			ctx->local_max_recv_packet = value;
+			packet_read_size = (size_t)value;
+			if (packet_read_size <= SIZE_MAX - sizeof(uint32_t))
+				packet_read_size += sizeof(uint32_t);
+			if (ctx->recvinbufsiz < packet_read_size)
+				ctx->recvinbufsiz = packet_read_size;
 			ctx->opts |= KNC_OPT_SENDCMDS;
 			ctx->capabilities_sent = 0;
 		}
 		break;
 
 	case KNC_OPT_MAX_SEND_PACKET:
-		if (value > 0)
+		if (value > 0) {
 			ctx->gssmaxpacket = value;
+			if (ctx->sendinbufsiz < (size_t)value)
+				ctx->sendinbufsiz = (size_t)value;
+			if (ctx->sendmax < (size_t)value)
+				ctx->sendmax = (size_t)value;
+		}
 		break;
 
 	default:
@@ -3675,6 +3717,7 @@ knc_fill(knc_ctx ctx, int dir)
 	ssize_t	  len;
 	size_t	  wanted;
 	void	 *tmpbuf;
+	stream	  instream;
 	ssize_t	(*ourread)(void *, void *, size_t);
 	void	 *ourcookie;
 	ssize_t	  ret;
@@ -3685,10 +3728,12 @@ knc_fill(knc_ctx ctx, int dir)
 	if (dir == KNC_DIR_SEND) {
 		ourread   =  ctx->localread;
 		ourcookie =  ctx->localcookie;
+		instream  = &ctx->raw_send;
 		wanted	  =  MIN(ctx->gssmaxpacket, ctx->sendinbufsiz);
 	} else {
 		ourread   = ctx->netread;
 		ourcookie = ctx->netcookie;
+		instream  = &ctx->raw_recv;
 		wanted	  = ctx->recvinbufsiz;
 	}
 
@@ -3699,7 +3744,7 @@ knc_fill(knc_ctx ctx, int dir)
 	if (!ourread || !ourcookie)
 		return EINVAL;
 
-	len = knc_get_ibuf(ctx, dir, &tmpbuf, wanted);
+	len = get_istream_max(instream, &tmpbuf, wanted, wanted);
 	if (!len) {
 		knc_enomem(ctx);
 		return ENOMEM;

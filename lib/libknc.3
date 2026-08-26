@@ -425,6 +425,9 @@ Peers that do not advertise this capability are treated as supporting
 only the legacy 64KB packet size.
 Setting this option above the legacy size enables command packets so
 that the capability can be sent.
+If necessary, this also raises
+.Dv KNC_OPT_RECVINBUFSIZ
+enough to read a complete packet length and payload.
 .It KNC_OPT_MAX_SEND_PACKET int
 sets the maximum plaintext packet size that this context will try to
 hand to
@@ -432,6 +435,9 @@ hand to
 The actual packet size is still capped by the peer's advertised
 .Dv KNC_OPT_MAX_RECV_PACKET
 capability.
+If necessary, this also raises the send input and output buffer
+watermarks so descriptor-driven transfers can read and queue a full
+packet-sized chunk.
 .El
 .Pp
 These options are manipulated using the following two functions:
