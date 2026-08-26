@@ -57,6 +57,18 @@
 .Fa "knc_ctx ctx" "const char *hostservice"
 .Fa "const char *defservice"
 .Fc
+.Ft int
+.Fo knc_export_sec_context
+.Fa "knc_ctx ctx" "void **token" "size_t *token_len"
+.Fa "unsigned *opts"
+.Fc
+.Ft int
+.Fo knc_import_sec_context
+.Fa "knc_ctx ctx" "const void *token" "size_t token_len"
+.Fa "unsigned opts"
+.Fc
+.Ft void
+.Fn knc_release_exported_sec_context "void *token" "size_t token_len"
 .Ft void
 .Fn knc_set_cb "knc_ctx ctx" "gss_channel_bindings_t bindings"
 .Ft void
@@ -491,6 +503,34 @@ Do not use the delegated credential handle returned by
 after calling
 .Fn knc_free_deleg_cred .
 Use this function to drop access to privileged material (delegated credentials).
+.It Fn knc_export_sec_context ctx token token_len opts
+flushes the final authentication output and exports an established GSS context
+for transfer to another process.
+The connexion must still be at the post-authentication boundary: application
+input, output, partial wire records, and KNC commands must not be buffered.
+Delegated credentials cannot be transferred by this interface.
+On success, the original context is no longer authenticated,
+.Fa token
+and
+.Fa token_len
+describe an opaque interprocess token, and
+.Fa opts
+contains the protocol options required by the importing context.
+The caller transfers the network descriptor separately, for example with
+.Dv SCM_RIGHTS .
+.It Fn knc_import_sec_context ctx token token_len opts
+imports an exported security context into a fresh KNC context.
+After GSS imports the opaque token, libknc inquires the resulting context to
+populate its initiator and acceptor names, mechanism, flags, lifetime, and
+connexion role.  It also restores the supplied protocol options and verifies
+KNC's required GSS services.  None of the mechanism-defined context state is
+encoded separately by libknc.
+The caller associates the transferred network descriptor with the context
+separately.
+.It Fn knc_release_exported_sec_context token token_len
+erases and releases a token returned by
+.Fn knc_export_sec_context .
+Call it after the receiving process has copied or imported the token.
 .It Fn knc_get_net_rfd ctx
 returns the read fd associated with the network side of the context or -1
 if no fd is associated.

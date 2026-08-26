@@ -1489,6 +1489,200 @@ knc_free_deleg_cred(knc_ctx ctx)
 	return;
 }
 
+/*
+ * Only protocol-affecting options cross a process boundary with a security
+ * context.  Descriptor flags are properties of the descriptor transferred by
+ * the caller and are set independently in the receiving process.
+ */
+#define KNC_TRANSFER_OPTS (KNC_OPT_NOPRIVACY | KNC_OPT_SENDCMDS)
+#define KNC_MAX_EXPORTED_CONTEXT (1024 * 1024)
+
+static int
+knc_transfer_streams_empty(knc_ctx ctx)
+{
+
+	return stream_avail(&ctx->raw_recv) == 0 &&
+	    stream_avail(&ctx->cooked_recv) == 0 &&
+	    stream_avail(&ctx->raw_send) == 0 &&
+	    stream_avail(&ctx->cooked_send) == 0;
+}
+
+int
+knc_export_sec_context(knc_ctx ctx, void **token, size_t *token_len,
+    unsigned *opts)
+{
+	gss_buffer_desc	 out = GSS_C_EMPTY_BUFFER;
+	OM_uint32	 maj;
+	OM_uint32	 min;
+	int		 ret;
+
+	if (!ctx || !token || !token_len || !opts) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	*token = NULL;
+	*token_len = 0;
+	*opts = 0;
+
+	if (ctx->error) {
+		errno = EIO;
+		return -1;
+	}
+
+	if (ctx->state != STATE_SESSION) {
+		knc_proto_error(ctx, "GSS context is not at the transferable "
+		    "post-authentication boundary");
+		errno = EBUSY;
+		return -1;
+	}
+
+	if (ctx->deleg_cred != GSS_C_NO_CREDENTIAL) {
+		knc_proto_error(ctx, "delegated credentials cannot be transferred");
+		errno = ENOTSUP;
+		return -1;
+	}
+
+	/*
+	 * cooked_send may contain the acceptor's final authentication token.
+	 * Every other queue must already be empty: its presence would mean that
+	 * application data, a partial record, or a command has crossed the
+	 * ownership boundary.
+	 */
+	if (stream_avail(&ctx->raw_recv) != 0 ||
+	    stream_avail(&ctx->cooked_recv) != 0 ||
+	    stream_avail(&ctx->raw_send) != 0) {
+		knc_proto_error(ctx, "connexion has buffered data at GSS context "
+		    "export");
+		errno = EBUSY;
+		return -1;
+	}
+
+	ret = knc_flush(ctx, KNC_DIR_SEND, (size_t)-1);
+	if (ret != 0) {
+		errno = ret;
+		return -1;
+	}
+	knc_garbage_collect(ctx);
+
+	if (!knc_transfer_streams_empty(ctx)) {
+		knc_proto_error(ctx, "connexion has buffered data after flushing "
+		    "the final authentication token");
+		errno = EBUSY;
+		return -1;
+	}
+
+	maj = gss_export_sec_context(&min, &ctx->gssctx, &out);
+	KNC_GSS_ERROR(ctx, maj, min, -1, "gss_export_sec_context");
+
+	ctx->state = STATE_UNKNOWN;
+	if (out.value == NULL || out.length == 0 ||
+	    out.length > KNC_MAX_EXPORTED_CONTEXT) {
+		gss_release_buffer(&min, &out);
+		knc_proto_error(ctx, "exported GSS context has invalid length");
+		errno = EOVERFLOW;
+		return -1;
+	}
+	*token = out.value;
+	*token_len = out.length;
+	*opts = (unsigned)ctx->opts & KNC_TRANSFER_OPTS;
+	return 0;
+}
+
+int
+knc_import_sec_context(knc_ctx ctx, const void *token, size_t token_len,
+    unsigned opts)
+{
+	gss_buffer_desc	 in;
+	gss_name_t	 source = GSS_C_NO_NAME;
+	gss_name_t	 target = GSS_C_NO_NAME;
+	OM_uint32	 maj;
+	OM_uint32	 min;
+	OM_uint32	 inquire_min;
+	OM_uint32	 delete_min;
+	OM_uint32	 lifetime;
+	OM_uint32	 flags;
+	gss_OID		 mech = GSS_C_NO_OID;
+	int		 initiated;
+	int		 open;
+
+	if (!ctx || !token || token_len == 0 ||
+	    token_len > KNC_MAX_EXPORTED_CONTEXT ||
+	    (opts & ~KNC_TRANSFER_OPTS)) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	if (ctx->error || ctx->state != STATE_UNKNOWN ||
+	    ctx->gssctx != GSS_C_NO_CONTEXT || !knc_transfer_streams_empty(ctx)) {
+		knc_proto_error(ctx, "libknc context is not fresh at GSS context "
+		    "import");
+		errno = EBUSY;
+		return -1;
+	}
+
+	in.value = (void *)token;
+	in.length = token_len;
+	maj = gss_import_sec_context(&min, &in, &ctx->gssctx);
+	KNC_GSS_ERROR(ctx, maj, min, -1, "gss_import_sec_context");
+
+	maj = gss_inquire_context(&min, ctx->gssctx, &source, &target,
+	    &lifetime, &mech, &flags, &initiated, &open);
+	if (GSS_ERROR(maj)) {
+		inquire_min = min;
+		gss_delete_sec_context(&delete_min, &ctx->gssctx,
+		    GSS_C_NO_BUFFER);
+		knc_gss_error(ctx, maj, inquire_min, "gss_inquire_context");
+		return -1;
+	}
+
+	if (!open) {
+		gss_release_name(&min, &source);
+		gss_release_name(&min, &target);
+		gss_delete_sec_context(&min, &ctx->gssctx, GSS_C_NO_BUFFER);
+		knc_proto_error(ctx, "imported GSS context is not open");
+		errno = EINVAL;
+		return -1;
+	}
+
+	ctx->opts = (ctx->opts & ~KNC_TRANSFER_OPTS) |
+	    ((int)opts & KNC_TRANSFER_OPTS);
+	ctx->client = source;
+	ctx->inq_service = target;
+	ctx->ret_mech = mech;
+	ctx->ret_flags = flags;
+	ctx->time_rec = lifetime;
+	ctx->locally_initiated = initiated;
+
+	if (knc_check_ret_flags(ctx) < 0) {
+		gss_delete_sec_context(&min, &ctx->gssctx, GSS_C_NO_BUFFER);
+		return -1;
+	}
+
+	ctx->state = STATE_SESSION;
+	return 0;
+}
+
+void
+knc_release_exported_sec_context(void *token, size_t token_len)
+{
+	gss_buffer_desc	 buf;
+	OM_uint32	 min;
+	volatile unsigned char *p;
+	size_t		 left;
+
+	if (!token)
+		return;
+
+	p = token;
+	left = token_len;
+	while (left-- > 0)
+		*p++ = 0;
+	buf.value = token;
+	buf.length = token_len;
+	gss_release_buffer(&min, &buf);
+}
+
 /* XXXrcd: deal with all the flags */
 
 void
