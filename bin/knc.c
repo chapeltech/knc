@@ -95,6 +95,7 @@ static int	 app_oid_equal(gss_OID, gss_OID);
 static char	*app_oid_to_hex(gss_OID);
 static int	 attach_local_fds(knc_ctx, int, int);
 static int	 attach_net_fd(knc_ctx, int, int);
+static int	 authenticate(knc_ctx);
 static int	 authenticate_client(knc_ctx);
 static int	 authenticate_server(knc_ctx, work_t *);
 static int	 configure_network(knc_ctx, int);
@@ -992,12 +993,77 @@ attach_net_fd(knc_ctx ctx, int fd, int linger)
 }
 
 static int
+authenticate(knc_ctx ctx)
+{
+	knc_callback	 cbs[4];
+	struct pollfd	 fds[4];
+	struct timespec	 deadline;
+	struct timespec	 now;
+	nfds_t		 nfds;
+	long		 seconds;
+	long		 nanoseconds;
+	int		 ret;
+	int		 timeout;
+
+	if (clock_gettime(CLOCK_MONOTONIC, &deadline) < 0) {
+		LOG_ERRNO(LOG_ERR, ("unable to set authentication deadline"));
+		return 0;
+	}
+	deadline.tv_sec += prefs.handshake_timeout;
+
+	while (!knc_is_authenticated(ctx) && !knc_error(ctx)) {
+		nfds = knc_get_pollfds(ctx, fds, cbs, 4);
+		if (nfds == (nfds_t)-1) {
+			LOG(LOG_ERR, ("knc_get_pollfds failed during handshake"));
+			return 0;
+		}
+
+		if (clock_gettime(CLOCK_MONOTONIC, &now) < 0) {
+			LOG_ERRNO(LOG_ERR,
+			    ("unable to check authentication deadline"));
+			return 0;
+		}
+
+		seconds = deadline.tv_sec - now.tv_sec;
+		nanoseconds = deadline.tv_nsec - now.tv_nsec;
+		if (nanoseconds < 0) {
+			seconds--;
+			nanoseconds += 1000000000L;
+		}
+		if (seconds < 0 || (seconds == 0 && nanoseconds == 0)) {
+			LOG(LOG_ERR, ("authentication timed out after %d seconds",
+			    prefs.handshake_timeout));
+			return 0;
+		}
+
+		timeout = (int)(seconds * 1000 +
+		    (nanoseconds + 999999L) / 1000000L);
+		ret = poll(fds, nfds, timeout);
+		if (ret < 0) {
+			if (errno == EINTR || errno == EAGAIN)
+				continue;
+			LOG_ERRNO(LOG_ERR, ("poll failed during handshake"));
+			return 0;
+		}
+		if (ret == 0) {
+			LOG(LOG_ERR, ("authentication timed out after %d seconds",
+			    prefs.handshake_timeout));
+			return 0;
+		}
+
+		knc_service_pollfds(ctx, fds, cbs, nfds);
+		knc_garbage_collect(ctx);
+	}
+
+	return knc_is_authenticated(ctx) && !knc_error(ctx);
+}
+
+static int
 authenticate_client(knc_ctx ctx)
 {
 
 	knc_set_opt(ctx, KNC_SOCK_NONBLOCK, 1);
-	knc_authenticate(ctx);
-	if (knc_error(ctx)) {
+	if (!authenticate(ctx)) {
 		LOG(LOG_ERR, ("handshake with peer failed: %s",
 		    knc_errstr(ctx)));
 		return 0;
@@ -1012,8 +1078,7 @@ authenticate_server(knc_ctx ctx, work_t *work)
 	gss_name_t	client;
 
 	knc_accept(ctx);
-	knc_authenticate(ctx);
-	if (knc_error(ctx)) {
+	if (!authenticate(ctx)) {
 		LOG(LOG_ERR, ("handshake with peer failed: %s",
 		    knc_errstr(ctx)));
 		return 0;

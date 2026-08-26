@@ -5,14 +5,17 @@ LDADD = ../lib/libknc.la
 
 bin_PROGRAMS = unit unit-simple testknc servefile
 check_PROGRAMS = unit-stream unit-pollfds unit-eof
-TESTS = unit-stream unit-pollfds unit-eof
+TEST_EXTENSIONS = .py
+PY_LOG_COMPILER = python3
+TESTS_ENVIRONMENT = KNC=$(abs_top_builddir)/bin/knc
+TESTS = unit-stream unit-pollfds unit-eof knc-handshake-timeout.py
 
 unit_stream_SOURCES = unit-stream.c
 unit_stream_LDADD = $(GSSAPI_LIBS)
 unit_pollfds_LDADD = $(GSSAPI_LIBS)
 unit_eof_LDADD = $(GSSAPI_LIBS)
 
-EXTRA_DIST = knc-exec-tests.py knc-bench.py
+EXTRA_DIST = knc-exec-tests.py knc-bench.py knc-handshake-timeout.py
 KNC_EXEC_TEST_ARGS =
 KNC_BENCH_ARGS =
 
