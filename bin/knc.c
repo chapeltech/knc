@@ -1910,12 +1910,12 @@ sockaddr_2str(work_t *work, const struct sockaddr *sa, socklen_t len)
 int
 do_work(knc_ctx ctx, work_t *work, int argc, char **argv)
 {
-	int		ret;
+	int		ret = 0;
 	int		local = 0;
 
 	if (!authenticate_server(ctx, work)) {
 		LOG(LOG_ERR, ("handshake with peer failed"));
-		return 0;
+		goto out;
 	}
 
 	/* Now we have credentials */
@@ -1925,7 +1925,7 @@ do_work(knc_ctx ctx, work_t *work, int argc, char **argv)
 
 	if (local) {
 		if (!do_unix_socket(ctx))
-			return 0;
+			goto out;
 	} else {
 		/*
 		 * Environment variables must be populated before exec.
@@ -1951,15 +1951,15 @@ do_work(knc_ctx ctx, work_t *work, int argc, char **argv)
 		      send_creds(ctx, local, "END", NULL))) {
 			LOG(LOG_ERR, ("Failed to propagate creds.  connection "
 				      "terminated."));
-			return 0;
+			goto out;
 		}
 
 		/* Handle the non-Unix-domain-socket case. */
 		if (argc == 0) {
 			if (!attach_local_fds(ctx, STDOUT_FILENO, STDIN_FILENO))
-				return 0;
+				goto out;
 		} else if (!launch_program(ctx, work, argc, argv))
-			exit(1);
+			goto out;
 	}
 
 	if (local) {
@@ -1984,12 +1984,13 @@ do_work(knc_ctx ctx, work_t *work, int argc, char **argv)
 		      send_creds(ctx, local, "END", NULL))) {
 			LOG(LOG_ERR, ("Failed to propagate creds.  connection "
 				      "terminated."));
-			return 0;
+			goto out;
 		}
 	}
 
 	ret = move_data(ctx, work);
 
+out:
 	if (work->local_err != -1) {
 		close(work->local_err);
 		work->local_err = -1;
@@ -2056,7 +2057,7 @@ launch_program(knc_ctx ctx, work_t *work, int argc, char **argv)
 			close(stdin_fds[1]);
 			close(stdout_fds[1]);
 			close(prog_err[1]);
-			return 0;
+			_exit(1);
 		}
 
 		if (dup2(stdout_fds[1], STDOUT_FILENO) < 0) {
@@ -2064,7 +2065,7 @@ launch_program(knc_ctx ctx, work_t *work, int argc, char **argv)
 			close(stdin_fds[1]);
 			close(stdout_fds[1]);
 			close(prog_err[1]);
-			return 0;
+			_exit(1);
 		}
 
 		close(stdin_fds[1]);
@@ -2073,7 +2074,7 @@ launch_program(knc_ctx ctx, work_t *work, int argc, char **argv)
 		if (dup2(prog_err[1], STDERR_FILENO) < 0) {
 			LOG_ERRNO(LOG_ERR, ("STDERR_FILENO dup2 failed"));
 			close(prog_err[1]);
-			return 0;
+			_exit(1);
 		}
 
 		close(prog_err[1]);
@@ -2085,7 +2086,7 @@ launch_program(knc_ctx ctx, work_t *work, int argc, char **argv)
 		/* If we get here, the exec failed */
 
 		LOG_ERRNO(LOG_ERR, ("exec of %s failed", argv[0]));
-		exit(1);
+		_exit(1);
 	}
 
 	/* parent */
@@ -2163,7 +2164,12 @@ do_unix_socket(knc_ctx ctx)
 		return 0;
 	}
 
-	return attach_local_fds(ctx, fd, fd);
+	if (!attach_local_fds(ctx, fd, fd)) {
+		close(fd);
+		return 0;
+	}
+
+	return 1;
 }
 
 int
@@ -2268,10 +2274,13 @@ do_inetd_nowait(int argc, char **argv)
 	}
 
 	ctx = app_ctx_init();
-	if (ctx == NULL || !attach_net_fd(ctx, fd, 1)) {
-		if (ctx != NULL)
-			knc_ctx_destroy(ctx);
+	if (ctx == NULL) {
 		close(fd);
+		work_free(&work);
+		return 0;
+	}
+	if (!attach_net_fd(ctx, fd, 1)) {
+		knc_ctx_destroy(ctx);
 		work_free(&work);
 		return 0;
 	}
