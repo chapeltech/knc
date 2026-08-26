@@ -77,7 +77,7 @@ int	fork_and_do_unix_socket(work_t *, int, int);
 int	do_client(int, char **);
 int	send_creds(knc_ctx, int, const char *const, const char * const);
 int	emit_key_value(int, const char * const, const char * const);
-int	putenv_knc_key_value(const char * const, const char * const);
+int	setenv_knc_key_value(const char * const, const char * const);
 int	do_work(knc_ctx, work_t *, int, char **);
 int	fork_and_do_work(work_t *, int, int, int, char **);
 void	work_init(work_t *);
@@ -1734,7 +1734,7 @@ send_creds(knc_ctx ctx, int local, const char *const key,
 	if (!value)
 		return 1;
 
-	return putenv_knc_key_value(key, value);
+	return setenv_knc_key_value(key, value);
 }
 
 int
