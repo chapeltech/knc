@@ -83,6 +83,14 @@ void		knc_set_opt(knc_ctx, unsigned, int);
 #define KNC_OPT_RECVINBUFSIZ	0x8002
 
 int		knc_is_authenticated(knc_ctx);
+/* These operations stay in the GSS provider which owns the context. */
+int		knc_userok(knc_ctx, const char *);
+int		knc_localname(knc_ctx, char **, size_t *);
+int		knc_display_name(knc_ctx, char **, size_t *);
+void		knc_free_name(char *);
+/* Direction state, independent of pending data in the opposite direction. */
+int		knc_read_open(knc_ctx);
+int		knc_write_open(knc_ctx);
 void		knc_set_cred(knc_ctx, gss_cred_id_t);
 void		knc_set_service(knc_ctx, gss_name_t);
 void		knc_import_set_service(knc_ctx, const char *, const gss_OID);

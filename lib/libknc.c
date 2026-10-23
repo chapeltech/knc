@@ -3237,6 +3237,18 @@ knc_eof(knc_ctx ctx)
 }
 
 int
+knc_read_open(knc_ctx ctx)
+{
+	return ctx && (ctx->open & OPEN_READ) != 0;
+}
+
+int
+knc_write_open(knc_ctx ctx)
+{
+	return ctx && (ctx->open & OPEN_WRITE) != 0;
+}
+
+int
 knc_io_complete(knc_ctx ctx)
 {
 
