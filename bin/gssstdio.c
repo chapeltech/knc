@@ -769,9 +769,16 @@ gstd_errstring(char **str, int min_stat)
 	tmp = NULL;
 
 	do {
+		status.length = 0;
+		status.value = NULL;
 		ret = gss_display_status(&new_stat, min_stat,
 		    GSS_C_MECH_CODE, GSS_C_NO_OID, &msg_ctx,
 		    &status);
+
+		if (GSS_ERROR(ret)) {
+			gss_release_buffer(&new_stat, &status);
+			return len;
+		}
 
 		/* GSSAPI strings are not NUL terminated */
 		if ((statstr = (char *)malloc(status.length + 1)) == NULL) {
@@ -785,12 +792,6 @@ gstd_errstring(char **str, int min_stat)
 
 		memcpy(statstr, status.value, status.length);
 		statstr[status.length] = '\0';
-
-		if (GSS_ERROR(ret)) {
-			free(statstr);
-			free(tmp);
-			break;
-		}
 
 		if (*str) {
 			if ((*str = malloc(strlen(*str) + status.length +
