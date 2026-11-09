@@ -531,7 +531,7 @@ put_stream_mmapbuf(struct stream *s, size_t len, int flags, int fd,
 	offset -= add_offset;
 
 	r->buf = mmap(NULL, len + add_offset, PROT_READ, flags, fd, offset);
-	r->len = len;
+	r->len = len + add_offset;
 
 	/* XXXrcd: better errors would be appreciated... */
 
@@ -541,7 +541,7 @@ put_stream_mmapbuf(struct stream *s, size_t len, int flags, int fd,
 		return -1;
 	}
 
-	return put_stream_userbuf(s, (char *)r->buf + add_offset, r->len,
+	return put_stream_userbuf(s, (char *)r->buf + add_offset, len,
 	    free_mmapbuf, r);
 }
 
