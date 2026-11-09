@@ -223,6 +223,9 @@ class KNCExecTests(unittest.TestCase):
                     rdns = false
                     dns_canonicalize_hostname = false
                     ticket_lifetime = 1h
+
+                [domain_realm]
+                    127.0.0.1 = {realm}
             """.format(realm=REALM)))
 
         cls.run_checked([
