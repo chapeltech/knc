@@ -1608,6 +1608,7 @@ knc_state_session(knc_ctx ctx, void *buf, size_t len)
 
 	if (!(ctx->open & OPEN_READ)) {
 		knc_proto_error(ctx, "Data after EOF");
+		gss_release_buffer(&min, &out);
 		return -1;
 	}
 
