@@ -2097,6 +2097,7 @@ knc_put_command(knc_ctx ctx, const char *cmd, uint32_t cmdseqno,
 	char	*buf;
 	char	*tmp;
 	size_t	 len = 0;
+	size_t	 ret;
 	size_t	 tlen = 0;
 
 	len = sizeof(cmdseqno) + strlen(cmd) + 1 + sizeof(datalen) + datalen;
@@ -2132,7 +2133,9 @@ knc_put_command(knc_ctx ctx, const char *cmd, uint32_t cmdseqno,
 
 	knc_debugf(ctx, "putting command: %s seq=%u\n", cmd, cmdseqno);
 
-	return put_stream_command(&ctx->raw_send, buf, len);
+	ret = put_stream_command(&ctx->raw_send, buf, len);
+	free(buf);
+	return ret;
 }
 
 size_t
