@@ -342,7 +342,7 @@ gstd_initiate(const char *hostname, const char *service, const char *princ,
 	gss_ctx_id_t	ctx = GSS_C_NO_CONTEXT;
 	gss_buffer_desc	in, out;
 	gss_OID		type;
-	OM_uint32	maj, min;
+	OM_uint32	maj, min, release_min;
 	OM_uint32	ret_flags = 0;
 	OM_uint32	req_flags;
 	gss_buffer_desc	name;
@@ -371,6 +371,8 @@ gstd_initiate(const char *hostname, const char *service, const char *princ,
 	}
 
 	maj = gss_import_name(&min, &name, type, &server);
+	if (!princ)
+		free(name.value);
 	GSTD_GSS_ERROR(maj, min, NULL, "gss_import_name");
 
 	in.length = 0;
@@ -385,14 +387,17 @@ again:
 	    global_mech, req_flags, 0,
 	    GSS_C_NO_CHANNEL_BINDINGS, &in, NULL, &out, &ret_flags, NULL);
 
+	if (in.length) {
+		gss_release_buffer(&release_min, &in);
+		in.length = 0;
+	}
+
 	if (out.length && write_packet(fd, &out))
-		return NULL;
+		goto fail;
 
-	GSTD_GSS_ERROR(maj, min, NULL, "gss_init_sec_context");
-
-	if (GSS_ERROR(maj) && ctx != GSS_C_NO_CONTEXT) {
-		gss_delete_sec_context(&min, &ctx, GSS_C_NO_BUFFER);
-		return NULL;
+	if (GSS_ERROR(maj)) {
+		gstd_error(LOG_ERR, min, "gss_init_sec_context");
+		goto fail;
 	}
 
 	if (maj & GSS_S_CONTINUE_NEEDED) {
@@ -402,20 +407,25 @@ again:
 
 		if (ret < 1) {
 			LOG(LOG_ERR, ("continuation failed"));
-			return NULL;
+			goto fail;
 		}
 
 		goto again;
 	}
 
-	if (gstd_check_ret_flags(ret_flags) < 0) {
-		gss_delete_sec_context(&min, &ctx, GSS_C_NO_BUFFER);
-		return NULL;
-	}
+	if (gstd_check_ret_flags(ret_flags) < 0)
+		goto fail;
 
 	LOG(LOG_DEBUG, ("authenticated"));
+	gss_release_name(&min, &server);
 	SETUP_GSTD_TOK(tok, ctx, fd, "gstd_connect");
 	return tok;
+
+fail:
+	if (ctx != GSS_C_NO_CONTEXT)
+		gss_delete_sec_context(&min, &ctx, GSS_C_NO_BUFFER);
+	gss_release_name(&min, &server);
+	return NULL;
 }
 
 #ifdef MIN
