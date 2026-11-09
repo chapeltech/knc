@@ -722,9 +722,9 @@ write_packet(int fd, gss_buffer_t buf)
  */
 int
 writen(int fd, const void *buf, ssize_t len) {
-	int	nleft;
-	int	nwritten;
-	char *	buffer = (char *)buf;
+	ssize_t		 nleft;
+	ssize_t		 nwritten;
+	const char	*buffer = buf;
 
 	nleft = len;
 	while (nleft > 0) {
@@ -743,7 +743,7 @@ writen(int fd, const void *buf, ssize_t len) {
 		}
 	}
 
-	LOG(LOG_DEBUG, ("wrote %d bytes", len));
+	LOG(LOG_DEBUG, ("wrote %zd bytes", len));
 	return len;
 }
 

@@ -5,11 +5,14 @@ LDADD = ../lib/libknc.la
 
 bin_PROGRAMS = unit unit-simple testknc servefile
 
-check_PROGRAMS = unit-stream
-TESTS = unit-stream
+check_PROGRAMS = unit-stream unit-writen
+TESTS = unit-stream unit-writen
 
 unit_stream_SOURCES = unit-stream.c
 unit_stream_LDADD = $(GSSAPI_LIBS)
+
+unit_writen_SOURCES = unit-writen.c
+unit_writen_LDADD = $(GSSAPI_LIBS)
 
 EXTRA_DIST = knc-exec-tests.py
 KNC_EXEC_TEST_ARGS =
