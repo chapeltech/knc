@@ -766,15 +766,12 @@ get_ostream_contig(stream s, void **buf, size_t len)
 	memcpy(*buf, (char *)cur->buf + s->bufpos, retlen);
 	cur = cur->next;
 
-	while (retlen < len) {
+	while (retlen < len && cur && cur->type == STREAM_BUFFER) {
 		tmplen = MIN(len - retlen, cur->len);
 		memcpy((char *)*buf + retlen, cur->buf, tmplen);
 
 		cur = cur->next;
 		retlen += tmplen;
-
-		if (!cur || cur->type != STREAM_BUFFER)
-			break;
 	}
 
 	return retlen;
