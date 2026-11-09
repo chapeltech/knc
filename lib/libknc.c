@@ -154,6 +154,7 @@ struct internal_knc_ctx {
 #define STATE_INIT	0x2
 #define STATE_SESSION	0x3
 #define STATE_COMMAND	0x4
+	int			 cmdblocked;
 	int			 error;
 	int			 debug;
 	char			 debug_prefix[64];
@@ -1844,6 +1845,8 @@ knc_state_command(knc_ctx ctx, void *buf, size_t len)
 
 done:
 	gss_release_buffer(&min, &out);
+	if (!knc_need_input(ctx, KNC_DIR_SEND))
+		ctx->cmdblocked = 1;
 	return 0;
 }
 
@@ -2573,16 +2576,25 @@ knc_need_input(knc_ctx ctx, int dir)
 	if (!ctx)
 		return 0;
 
+	if (dir == KNC_DIR_SEND)
+		return knc_pending(ctx, KNC_DIR_SEND) < ctx->sendinbufsiz;
+
 	/*
 	 * We only check the amount of data we have decrypted, because
 	 * we could lockup if we don't try to read when we have a
 	 * partial packet in the ctx->raw_recv buffer.
 	 */
 
-	if (dir == KNC_DIR_RECV)
-		return stream_avail(&ctx->cooked_recv) < ctx->recvinbufsiz;
+	if (stream_avail(&ctx->cooked_recv) >= ctx->recvinbufsiz)
+		return 0;
 
-	return knc_pending(ctx, KNC_DIR_SEND) < ctx->sendinbufsiz;
+	/* Stop reading if processing a command filled the send queue. */
+
+	if (ctx->cmdblocked && !knc_need_input(ctx, KNC_DIR_SEND))
+		return 0;
+
+	ctx->cmdblocked = 0;
+	return 1;
 }
 
 int
