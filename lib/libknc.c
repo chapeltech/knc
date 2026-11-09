@@ -206,6 +206,7 @@ struct fd_cookie {
 #endif
 
 #define MAX_IOVCNT	32
+#define MAX_COMMANDS_PER_PACKET	64
 
 #define KNC_GSS_ERROR(_ctx, _maj, _min, _ret, _str) do {		\
 		if (__predict_false(GSS_ERROR((_maj)))) {		\
@@ -1753,6 +1754,7 @@ knc_state_command(knc_ctx ctx, void *buf, size_t len)
 	uint32_t	 cmdseqno;
 	char		*cmdbuf;
 	uint32_t	 cmdbuflen;
+	size_t		 command_count = 0;
 	size_t		 remainlen;
 	int		 conf_state = 0;
 
@@ -1820,6 +1822,11 @@ knc_state_command(knc_ctx ctx, void *buf, size_t len)
 	remainlen = out.length;
 	do {
 		void	*oldptr = cmdbuf;
+
+		if (++command_count > MAX_COMMANDS_PER_PACKET) {
+			knc_proto_error(ctx, "Too many commands in packet");
+			goto done;
+		}
 
 		cmdbuflen = remainlen;
 
