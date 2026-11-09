@@ -634,8 +634,13 @@ read_packet(int fd, gss_buffer_t buf, int timeout, int first)
 	if (len_buf_pos != 4)
 		return -2;
 
-	/* We have the complete length */
-	len = ntohl(*(uint32_t *)len_buf);
+	/*
+	 * We have the complete length.  Copy it into an aligned object
+	 * rather than accessing the character buffer through a uint32_t
+	 * pointer, which violates strict aliasing and may be misaligned.
+	 */
+	memcpy(&len, len_buf, sizeof(len));
+	len = ntohl(len);
 
 	/*
 	 * We make sure recvd length is reasonable, allowing for some
