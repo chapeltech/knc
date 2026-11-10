@@ -233,6 +233,8 @@ struct fd_cookie {
 
 #define MAX_IOVCNT	32
 #define MAX_COMMANDS_PER_PACKET	64
+/* A valid command is at least 10 bytes, keeping this below 64 commands. */
+#define COMMAND_COALESCE_LIMIT	512
 
 #define KNC_GSS_ERROR(_ctx, _maj, _min, _ret, _str) do {		\
 		if (__predict_false(GSS_ERROR((_maj)))) {		\
@@ -268,6 +270,8 @@ static void		*get_stream_buf(stream, size_t);
 static void		 rel_stream_buf(stream, void *);
 static size_t		 alloc_stream_buf(stream, void **, size_t);
 static stream_bit	 alloc_stream_bit(stream, int, size_t);
+static size_t		 get_stream_bit_space(stream, stream_bit, void **,
+			     size_t);
 static size_t		 append_stream_bit(stream, stream_bit);
 static stream_bit	 alloc_stream_userbuf(stream, void *, size_t,
 			    void (*)(void *, void *), void *);
@@ -669,6 +673,17 @@ static size_t
 put_stream_command(stream s, void *buf, size_t len)
 {
 	stream_bit	tmp;
+	void		*newbuf;
+
+	if (s && s->cur && s->tail && s->tail->type == STREAM_COMMAND &&
+	    s->tail->len > 1 && len > 1 &&
+	    s->tail->len <= COMMAND_COALESCE_LIMIT &&
+	    len <= COMMAND_COALESCE_LIMIT - s->tail->len &&
+	    get_stream_bit_space(s, s->tail, &newbuf, len) == len) {
+		memcpy(newbuf, buf, len);
+		stream_fill(s, len);
+		return len;
+	}
 
 	tmp = alloc_stream_bit(s, STREAM_COMMAND, len);
 	if (!tmp)
@@ -708,52 +723,55 @@ knc_get_stream_command(stream s, size_t *len)
 }
 
 static size_t
+get_stream_bit_space(stream s, stream_bit bit, void **buf, size_t len)
+{
+	size_t	 remaining;
+	void	*newbuf;
+
+	assert(bit == s->tail);
+
+	if (bit->storage == STREAM_BUFFER_MINE) {
+		remaining = bit->data.b.allocated - bit->len;
+		if (remaining < len)
+			return 0;
+	} else if (bit->storage == STREAM_BUFFER_INLINE) {
+		remaining = INLINE_SIZE - bit->len;
+		if (remaining < len) {
+			if (len > (size_t)-1 - bit->len)
+				return 0;
+
+			remaining = alloc_stream_buf(s, &newbuf, bit->len + len);
+			if (!newbuf)
+				return 0;
+
+			memcpy(newbuf, bit->data.i.buf, bit->len);
+			bit->storage = STREAM_BUFFER_MINE;
+			bit->data.b.buf = newbuf;
+			bit->data.b.allocated = remaining;
+			remaining -= bit->len;
+		}
+	} else
+		return 0;
+
+	*buf = (char *)stream_bit_buf(bit) + bit->len;
+	return MIN(len, remaining);
+}
+
+static size_t
 get_istream(stream s, void **buf, size_t len)
 {
 	stream_bit	tmp;
-	size_t		remaining;
-	void		*newbuf;
+	size_t		ret;
 
 	if (!s) {
 		/* XXXrcd: better errors... */
 		return 0;
 	}
 
-	if (s->cur && s->tail && s->tail->type == STREAM_DATA &&
-	    s->tail->storage == STREAM_BUFFER_MINE) {
-		remaining = s->tail->data.b.allocated - s->tail->len;
-
-		if (remaining >= len) {
-			*buf = (void *)((char *)s->tail->data.b.buf +
-			    s->tail->len);
-			return MIN(len, remaining);
-		}
-	}
-
-	if (s->cur && s->tail && s->tail->type == STREAM_DATA &&
-	    s->tail->storage == STREAM_BUFFER_INLINE) {
-		remaining = INLINE_SIZE - s->tail->len;
-
-		if (remaining >= len) {
-			*buf = s->tail->data.i.buf + s->tail->len;
-			return MIN(len, remaining);
-		}
-
-		if (len > (size_t)-1 - s->tail->len)
-			return 0;
-
-		remaining = alloc_stream_buf(s, &newbuf, s->tail->len + len);
-		if (!newbuf)
-			return 0;
-
-		memcpy(newbuf, s->tail->data.i.buf, s->tail->len);
-		s->tail->storage = STREAM_BUFFER_MINE;
-		s->tail->data.b.buf = newbuf;
-		s->tail->data.b.allocated = remaining;
-
-		remaining -= s->tail->len;
-		*buf = (char *)s->tail->data.b.buf + s->tail->len;
-		return MIN(len, remaining);
+	if (s->cur && s->tail && s->tail->type == STREAM_DATA) {
+		ret = get_stream_bit_space(s, s->tail, buf, len);
+		if (ret || len == 0)
+			return ret;
 	}
 
 	tmp = alloc_stream_bit(s, STREAM_DATA, len);
