@@ -1937,9 +1937,7 @@ do_listener(int listener, int argc, char **argv)
 				++num_children;
 		}
 
-		/* And now, as the parent, we no longer need this work
-		   structure or file descriptor */
-		close(fd);
+		/* The parent no longer needs this work structure. */
 		work_free(work);
 		free(work);
 
