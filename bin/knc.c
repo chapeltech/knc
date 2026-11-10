@@ -103,6 +103,8 @@ void	sockaddr_2str(work_t *, const struct sockaddr *, socklen_t);
 #define POS
 #endif
 
+#define KNC_HANDSHAKE_TIMEOUT	60
+
 /* Look Ma, no threading */
 char _log_buff[2048];
 
@@ -1416,7 +1418,15 @@ do_work(work_t *work, int argc, char **argv)
 	 * We must establish what the remote end's credentials are, and
 	 * begin ferrying data to and fro.
 	 */
-	if (!handshake(work)) {
+	if (prefs.is_listener && !prefs.no_fork)
+		alarm(KNC_HANDSHAKE_TIMEOUT);
+
+	ret = handshake(work);
+
+	if (prefs.is_listener && !prefs.no_fork)
+		alarm(0);
+
+	if (!ret) {
 		LOG(LOG_ERR, ("handshake with peer failed"));
 		return 0;
 	}
