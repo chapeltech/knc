@@ -796,6 +796,7 @@ move_network_to_local_buffer(work_t *work)
 int
 move_local_to_network_buffer(work_t *work)
 {
+	ssize_t	n;
 
 	/* We should NOT be called if we've already buffered inbound data */
 	if (work->network_buffer.in_valid) {
@@ -804,22 +805,23 @@ move_local_to_network_buffer(work_t *work)
 		return -1;
 	}
 
-	work->network_buffer.in_len = read(work->local_in,
-					   work->network_buffer.in,
-					   sizeof(work->network_buffer.in));
-	if (work->network_buffer.in_len == 0) {
-		/* EOF */
+	n = read(work->local_in, work->network_buffer.in,
+	    sizeof(work->network_buffer.in));
+	if (n == 0)
 		return 0;
-	} else if (work->network_buffer.in_len < 0) {
+	if (n < 0) {
+		if (errno == EINTR || errno == EAGAIN)
+			return 1;
 		if (errno == ECONNRESET)
-			return 0; /* Treat as EOF */
+			return 0;
 
 		LOG_ERRNO(LOG_ERR, ("local read failed"));
 		return -1;
 	}
 
+	work->network_buffer.in_len = (size_t)n;
 	work->network_buffer.in_valid = 1;
-	return work->network_buffer.in_len;
+	return (int)n;
 }
 
 /*
