@@ -403,7 +403,7 @@ alloc_stream_bit(stream s, int type, size_t len)
 {
 	stream_bit	 bit;
 
-	len  = len / STREAM_BIT_ALLOC_UNIT + (len % STREAM_BIT_ALLOC_UNIT)?1:0;
+	len  = (len + STREAM_BIT_ALLOC_UNIT - 1) / STREAM_BIT_ALLOC_UNIT;
 	len *= STREAM_BIT_ALLOC_UNIT;
 	len  = MIN((2 * STREAM_BIT_ALLOC_UNIT), len);
 
