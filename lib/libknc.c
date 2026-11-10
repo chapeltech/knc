@@ -73,17 +73,42 @@
 #include "stubgsswrap.c"
 #endif
 
+struct stream_bit_buf {
+	void	*buf;
+	size_t	 allocated;
+};
+
+struct stream_bit_user {
+	void	 *buf;
+	void	(*free)(void *, void *);
+	void	 *cookie;
+};
+
+#define KNC_MAX(a,b)	(((a)>(b))?(a):(b))
+
+#define INLINE_SIZE	KNC_MAX(sizeof(struct stream_bit_buf),	\
+				sizeof(struct stream_bit_user))
+
+struct stream_bit_inline {
+	char	 buf[INLINE_SIZE];
+};
+
 struct stream_bit {
-	int			  type;
-#define	STREAM_BUFFER	0x1
-#define STREAM_COMMAND	0x2
+	unsigned		  type : 2;
+	unsigned		  storage : 2;
+#define STREAM_DATA		0x0
+#define STREAM_COMMAND		0x1
+#define	STREAM_BUFFER_MINE	0x1
+#define STREAM_BUFFER_USER	0x2
+#define STREAM_BUFFER_INLINE	0x3
 /* XXXrcd: we may want to push errors onto the streams, too? */
-	void			 *buf;
-	void			(*free)(void *, void *);
-	void			 *cookie;
+	union {
+		struct stream_bit_buf		b;
+		struct stream_bit_inline	i;
+		struct stream_bit_user		u;
+	} data;
 	struct stream_bit	 *next;
 	size_t			  len;
-	size_t			  allocated;
 };
 
 struct stream_gc {
@@ -238,8 +263,10 @@ static void	debug_printf(knc_ctx, const char *, ...)
 static void		 destroy_stream(stream);
 static stream_bit	 get_stream_bit(stream);
 static void		 rel_stream_bit(stream, stream_bit);
+static void		*stream_bit_buf(stream_bit);
 static void		*get_stream_buf(stream, size_t);
 static void		 rel_stream_buf(stream, void *);
+static size_t		 alloc_stream_buf(stream, void **, size_t);
 static stream_bit	 alloc_stream_bit(stream, int, size_t);
 static size_t		 append_stream_bit(stream, stream_bit);
 static stream_bit	 alloc_stream_userbuf(stream, void *, size_t,
@@ -250,6 +277,7 @@ static size_t	put_stream(stream, const void *, size_t);
 static size_t	put_stream_userbuf(stream, void *, size_t,
 		    void (*)(void *, void *), void *);
 static size_t	put_stream_gssbuf(stream, gss_buffer_t);
+static size_t	put_stream_gsspacket(stream, gss_buffer_t);
 static size_t	get_istream(stream, void **, size_t);
 static size_t	get_ostream(stream, void **, size_t);
 static size_t	get_ostreamv(stream, int, struct iovec **, int *);
@@ -342,6 +370,20 @@ rel_stream_bit(stream s, stream_bit bit)
 }
 
 static void *
+stream_bit_buf(stream_bit bit)
+{
+
+	switch (bit->storage) {
+	case STREAM_BUFFER_USER:
+		return bit->data.u.buf;
+	case STREAM_BUFFER_INLINE:
+		return bit->data.i.buf;
+	default:
+		return bit->data.b.buf;
+	}
+}
+
+static void *
 get_stream_buf(stream s, size_t len)
 {
 	size_t	idx;
@@ -379,6 +421,18 @@ rel_stream_buf(stream s, void *buf)
 }
 
 static size_t
+alloc_stream_buf(stream s, void **buf, size_t len)
+{
+
+	len  = (len + STREAM_BIT_ALLOC_UNIT - 1) / STREAM_BIT_ALLOC_UNIT;
+	len *= STREAM_BIT_ALLOC_UNIT;
+	len  = MIN((2 * STREAM_BIT_ALLOC_UNIT), len);
+
+	*buf = get_stream_buf(s, len);
+	return len;
+}
+
+static size_t
 append_stream_bit(stream s, stream_bit b)
 {
 
@@ -406,20 +460,21 @@ alloc_stream_bit(stream s, int type, size_t len)
 {
 	stream_bit	 bit;
 
-	len  = (len + STREAM_BIT_ALLOC_UNIT - 1) / STREAM_BIT_ALLOC_UNIT;
-	len *= STREAM_BIT_ALLOC_UNIT;
-	len  = MIN((2 * STREAM_BIT_ALLOC_UNIT), len);
-
 	bit = get_stream_bit(s);
 	if (!bit)
 		return NULL;
 
-	bit->type	= type;
-	bit->buf	= get_stream_buf(s, len);
-	bit->len	= 0;
-	bit->allocated	= len;
+	bit->type = type;
+	bit->len = 0;
+	if (len <= INLINE_SIZE) {
+		bit->storage = STREAM_BUFFER_INLINE;
+		return bit;
+	}
 
-	if (!bit->buf) {
+	bit->storage = STREAM_BUFFER_MINE;
+	bit->data.b.allocated	= alloc_stream_buf(s, &bit->data.b.buf, len);
+
+	if (!bit->data.b.buf) {
 		rel_stream_bit(s, bit);
 		return NULL;
 	}
@@ -465,12 +520,11 @@ alloc_stream_userbuf(stream s, void *buf, size_t len,
 		return NULL;
 	}
 
-	bit->type	= STREAM_BUFFER;
-	bit->buf	= buf;
-	bit->allocated	= len;
-	bit->len	= len;
-	bit->free	= callback;
-	bit->cookie	= cookie;
+	bit->storage		= STREAM_BUFFER_USER;
+	bit->data.u.buf		= buf;
+	bit->len		= len;
+	bit->data.u.free	= callback;
+	bit->data.u.cookie	= cookie;
 
 	return bit;
 }
@@ -488,43 +542,75 @@ put_stream_userbuf(stream s, void *buf, size_t len,
 	return append_stream_bit(s, bit);
 }
 
-/*ARGSUSED*/
 static void
 free_gssbuf(void *buf, void *cookie)
 {
-	OM_uint32	min;
+	stream_bit	 bit = cookie;
+	gss_buffer_desc	 gssbuf;
+	OM_uint32	 min;
 
-	gss_release_buffer(&min, cookie);
-	free(cookie);
+	gssbuf.value = buf;
+	gssbuf.length = bit->len;
+	gss_release_buffer(&min, &gssbuf);
 }
 
 static stream_bit
 alloc_stream_gssbuf(stream s, gss_buffer_t inbuf)
 {
-	gss_buffer_t	buf;
-	OM_uint32	min;
+	stream_bit	bit;
 
-	buf = calloc(1, sizeof(*buf));
-	if (!buf) {
-		gss_release_buffer(&min, inbuf);
+	bit = get_stream_bit(s);
+	if (!bit)
 		return NULL;
+
+	bit->storage		= STREAM_BUFFER_USER;
+	bit->data.u.buf		= inbuf->value;
+	bit->len		= inbuf->length;
+	bit->data.u.free	= free_gssbuf;
+	bit->data.u.cookie	= bit;
+
+	return bit;
+}
+
+static size_t
+put_stream_gsspacket(stream s, gss_buffer_t inbuf)
+{
+	stream_bit	buf;
+	stream_bit	prefix;
+	uint32_t	netlen;
+
+	prefix = get_stream_bit(s);
+	if (!prefix)
+		return 0;
+
+	buf = alloc_stream_gssbuf(s, inbuf);
+	if (!buf) {
+		rel_stream_bit(s, prefix);
+		return 0;
 	}
 
-	buf->value  = inbuf->value;
-	buf->length = inbuf->length;
+	netlen = htonl((uint32_t)inbuf->length);
+	prefix->storage = STREAM_BUFFER_INLINE;
+	memcpy(prefix->data.i.buf, &netlen, sizeof(netlen));
+	prefix->len = sizeof(netlen);
 
-	return alloc_stream_userbuf(s, buf->value, buf->length, free_gssbuf,
-	    buf);
+	append_stream_bit(s, prefix);
+	append_stream_bit(s, buf);
+
+	return prefix->len + buf->len;
 }
 
 static size_t
 put_stream_gssbuf(stream s, gss_buffer_t inbuf)
 {
 	stream_bit	bit;
+	OM_uint32	min;
 
 	bit = alloc_stream_gssbuf(s, inbuf);
-	if (!bit)
+	if (!bit) {
+		gss_release_buffer(&min, inbuf);
 		return 0;
+	}
 
 	return append_stream_bit(s, bit);
 }
@@ -584,22 +670,12 @@ put_stream_command(stream s, void *buf, size_t len)
 {
 	stream_bit	tmp;
 
-	/* Must mark current one as being full, innit? */
-
-	if (s->tail)
-		s->tail->allocated = s->tail->len;
-
-	/*
-	 * XXXrcd: might be an idea to use a new alloc which doesn't
-	 *         try to make a buffer that we can grow into per se.
-	 */
 	tmp = alloc_stream_bit(s, STREAM_COMMAND, len);
 	if (!tmp)
 		return 0;
 
-	memcpy(tmp->buf, buf, len);
+	memcpy(stream_bit_buf(tmp), buf, len);
 	tmp->len = len;
-	tmp->allocated = len;
 
 	append_stream_bit(s, tmp);
 
@@ -610,10 +686,7 @@ static int
 knc_get_stream_bit_type(stream s)
 {
 
-	if (!s || !s->cur)
-		return 0;
-
-	return s->cur->type;
+	return s && s->cur ? s->cur->type : STREAM_DATA;
 }
 
 static void *
@@ -625,7 +698,7 @@ knc_get_stream_command(stream s, size_t *len)
 		return NULL;
 
 	*len = s->cur->len;
-	 ret = s->cur->buf;
+	 ret = stream_bit_buf(s->cur);
 
 	s->cur = s->cur->next;
 
@@ -639,29 +712,60 @@ get_istream(stream s, void **buf, size_t len)
 {
 	stream_bit	tmp;
 	size_t		remaining;
+	void		*newbuf;
 
 	if (!s) {
 		/* XXXrcd: better errors... */
 		return 0;
 	}
 
-	if (s->cur && s->tail) {
-		remaining = s->tail->allocated - s->tail->len;
+	if (s->cur && s->tail && s->tail->type == STREAM_DATA &&
+	    s->tail->storage == STREAM_BUFFER_MINE) {
+		remaining = s->tail->data.b.allocated - s->tail->len;
 
 		if (remaining >= len) {
-			*buf = (void *)((char *)s->tail->buf + s->tail->len);
+			*buf = (void *)((char *)s->tail->data.b.buf +
+			    s->tail->len);
 			return MIN(len, remaining);
 		}
 	}
 
-	tmp = alloc_stream_bit(s, STREAM_BUFFER, len);
+	if (s->cur && s->tail && s->tail->type == STREAM_DATA &&
+	    s->tail->storage == STREAM_BUFFER_INLINE) {
+		remaining = INLINE_SIZE - s->tail->len;
+
+		if (remaining >= len) {
+			*buf = s->tail->data.i.buf + s->tail->len;
+			return MIN(len, remaining);
+		}
+
+		if (len > (size_t)-1 - s->tail->len)
+			return 0;
+
+		remaining = alloc_stream_buf(s, &newbuf, s->tail->len + len);
+		if (!newbuf)
+			return 0;
+
+		memcpy(newbuf, s->tail->data.i.buf, s->tail->len);
+		s->tail->storage = STREAM_BUFFER_MINE;
+		s->tail->data.b.buf = newbuf;
+		s->tail->data.b.allocated = remaining;
+
+		remaining -= s->tail->len;
+		*buf = (char *)s->tail->data.b.buf + s->tail->len;
+		return MIN(len, remaining);
+	}
+
+	tmp = alloc_stream_bit(s, STREAM_DATA, len);
 	if (!tmp)
 		return 0;
 
 	append_stream_bit(s, tmp);
 
-	*buf = tmp->buf;
-	return MIN(len, tmp->allocated);
+	*buf = stream_bit_buf(tmp);
+	if (tmp->storage == STREAM_BUFFER_INLINE)
+		return len;
+	return MIN(len, tmp->data.b.allocated);
 }
 
 /*
@@ -690,7 +794,7 @@ get_ostream(stream s, void **buf, size_t len)
 	 */
 
 	if (s->cur->len >= s->bufpos) {
-		*buf = (char *)s->cur->buf + s->bufpos;
+		*buf = (char *)stream_bit_buf(s->cur) + s->bufpos;
 		return MIN(len, s->cur->len - s->bufpos);
 	}
 
@@ -733,14 +837,14 @@ get_ostreamv(stream s, int maxcnt, struct iovec **vec,
 	len = 0;
 	cur = s->cur;
 
-	(*vec)[i  ].iov_base = (char *)cur->buf + s->bufpos;
+	(*vec)[i  ].iov_base = (char *)stream_bit_buf(cur) + s->bufpos;
 	(*vec)[i++].iov_len  = cur->len - s->bufpos;
 	len += cur->len - s->bufpos;
 	DEBUG((NULL, "creating iovec element of length %zu, total %zu\n",
 	    len, len));
 
 	for (cur = cur->next; cur; cur = cur->next) {
-		(*vec)[i].iov_base = cur->buf;
+		(*vec)[i].iov_base = stream_bit_buf(cur);
 		(*vec)[i].iov_len  = cur->len;
 		len += cur->len;
 		DEBUG((NULL, "creating iovec element of length %zu, "
@@ -797,12 +901,15 @@ get_ostream_contig(stream s, void **buf, size_t len)
 	cur = s->cur;
 
 	retlen = cur->len - s->bufpos;
-	memcpy(*buf, (char *)cur->buf + s->bufpos, retlen);
+	memcpy(*buf, (char *)stream_bit_buf(cur) + s->bufpos, retlen);
 	cur = cur->next;
 
-	while (retlen < len && cur && cur->type == STREAM_BUFFER) {
+	while (retlen < len && cur && cur->type == s->cur->type &&
+	    (cur->storage == STREAM_BUFFER_MINE ||
+	    cur->storage == STREAM_BUFFER_USER ||
+	    cur->storage == STREAM_BUFFER_INLINE)) {
 		tmplen = MIN(len - retlen, cur->len);
-		memcpy((char *)*buf + retlen, cur->buf, tmplen);
+		memcpy((char *)*buf + retlen, stream_bit_buf(cur), tmplen);
 
 		cur = cur->next;
 		retlen += tmplen;
@@ -846,14 +953,22 @@ stream_drain(stream s, size_t len)
 static ssize_t
 stream_fill(stream s, size_t len)
 {
+	size_t	allocated;
 
 	/* XXXrcd: perform sanity */
 
 	if (!s->cur || !s->tail)
 		return -1;
 
+	if (s->tail->storage == STREAM_BUFFER_MINE)
+		allocated = s->tail->data.b.allocated;
+	else if (s->tail->storage == STREAM_BUFFER_INLINE)
+		allocated = INLINE_SIZE;
+	else
+		return -1;
+
 	/* We do not have room. */
-	if (s->tail->allocated < s->tail->len + len)
+	if (allocated < s->tail->len + len)
 		/* XXXrcd: better errors here! */
 		return -1;
 
@@ -921,10 +1036,14 @@ stream_garbage_collect(stream s)
 	while (s->head && s->head != s->cur) {
 		tmpbit = s->head->next;
 
-		if (s->head->free)
-			s->head->free(s->head->buf, s->head->cookie);
-		else
-			rel_stream_buf(s, s->head->buf);
+		if (s->head->storage == STREAM_BUFFER_USER) {
+			if (s->head->data.u.free)
+				s->head->data.u.free(s->head->data.u.buf,
+				    s->head->data.u.cookie);
+			else
+				rel_stream_buf(s, s->head->data.u.buf);
+		} else if (s->head->storage != STREAM_BUFFER_INLINE)
+			rel_stream_buf(s, s->head->data.b.buf);
 
 		rel_stream_bit(s, s->head);
 		s->head = tmpbit;
@@ -1000,31 +1119,13 @@ read_packet(knc_ctx ctx, stream s, void **buf)
 static size_t
 put_packet(knc_ctx ctx, gss_buffer_t buf)
 {
-	stream_bit	gssbit;
-	stream_bit	lenbit;
-	uint32_t	netlen;
+	OM_uint32	min;
 
-	/* Prepare both stream bits before queueing either half of the frame. */
-	gssbit = alloc_stream_gssbuf(&ctx->cooked_send, buf);
-	if (!gssbit) {
+	if (put_stream_gsspacket(&ctx->cooked_send, buf) == 0) {
+		gss_release_buffer(&min, buf);
 		knc_enomem(ctx);
 		return 0;
 	}
-
-	lenbit = alloc_stream_bit(&ctx->cooked_send, STREAM_BUFFER,
-	    sizeof(netlen));
-	if (!lenbit) {
-		free_gssbuf(gssbit->buf, gssbit->cookie);
-		rel_stream_bit(&ctx->cooked_send, gssbit);
-		knc_enomem(ctx);
-		return 0;
-	}
-
-	netlen = htonl((uint32_t)gssbit->len);
-	memcpy(lenbit->buf, &netlen, sizeof(netlen));
-	lenbit->len = sizeof(netlen);
-	append_stream_bit(&ctx->cooked_send, lenbit);
-	append_stream_bit(&ctx->cooked_send, gssbit);
 
 	/* XXXrcd: useful to return this?  What about errors? */
 	return 0;
@@ -1984,40 +2085,28 @@ knc_state_process_out(knc_ctx ctx)
 		return 0;
 
 	while (stream_avail(&ctx->cooked_send) < ctx->sendmax) {
-		switch (knc_get_stream_bit_type(&ctx->raw_send)) {
-		case STREAM_COMMAND:
+		if (knc_get_stream_bit_type(&ctx->raw_send) == STREAM_COMMAND) {
 			buf = knc_get_stream_command(&ctx->raw_send, &len);
 			wrap_and_put_packet(ctx, buf, 0);
 			wrap_and_put_packet(ctx, buf, len);
-			break;
+			continue;
+		}
 
-		case STREAM_BUFFER:
-			/*
-			 * We clip the length at ctx->gssmaxpacket to make
-			 * the job of the receiver easier.
-			 */
+		/*
+		 * We clip the length at ctx->gssmaxpacket to make
+		 * the job of the receiver easier.
+		 */
 
-			len = get_ostream_contig(&ctx->raw_send, &buf,
-			    ctx->gssmaxpacket);
+		len = get_ostream_contig(&ctx->raw_send, &buf,
+		    ctx->gssmaxpacket);
 
-			if (len < 1) {
-				/* XXXrcd: ERRORS? Maybe there aren't any...? */
-				/*
-				 * XXXrcd: analyse this one a bit more,
-				 * what if we didn't get a byte because there
-				 * is a command pending?  Shouldn't happen,
-				 * but let's convince ourselves properly at
-				 * a later time...
-				 */
-				return 0;
-			}
-
-			wrap_and_put_packet(ctx, buf, len);
-			stream_drain(&ctx->raw_send, len);
-			break;
-		default:
+		if (len < 1) {
+			/* XXXrcd: ERRORS? Maybe there aren't any...? */
 			return 0;
 		}
+
+		wrap_and_put_packet(ctx, buf, len);
+		stream_drain(&ctx->raw_send, len);
 
 	}
 
