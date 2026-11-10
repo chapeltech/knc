@@ -927,7 +927,7 @@ int
 write_network_buffer(work_t *work)
 {
 	int		 len;
-	unsigned long	 packet_len;
+	uint32_t	 packet_len;
 	gss_buffer_desc	 in;
 	gss_buffer_desc	 out;
 	OM_uint32	 maj;
