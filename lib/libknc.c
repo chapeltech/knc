@@ -456,9 +456,11 @@ put_stream_userbuf(stream s, void *buf, size_t len,
 	stream_bit	bit;
 
 	bit = get_stream_bit(s);
-	if (!bit)
-		/* XXXrcd: hmmm, maybe we should raise an error here? */
+	if (!bit) {
+		if (callback)
+			callback(buf, cookie);
 		return 0;
+	}
 
 	bit->type	= STREAM_BUFFER;
 	bit->buf	= buf;
@@ -2017,7 +2019,8 @@ knc_put_ubuf(knc_ctx ctx, int dir, void *buf, size_t len,
 {
 
 	if (!ctx) {
-		/* XXXrcd: should probably call the callback to free things. */
+		if (callback)
+			callback(buf, cookie);
 		return 0;
 	}
 

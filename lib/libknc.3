@@ -587,6 +587,7 @@ the desired stream.
 .It Fn knc_put_ubuf ctx dir buf len callback cookie
 will put the provided buffer directly into the input side of
 the desired stream.
+Ownership of the buffer is transferred by the call.
 When the contents of the buffer have been consumed,
 .Fn callback
 is called with
@@ -594,6 +595,11 @@ is called with
 and
 .Ar cookie
 as its arguments.
+If the buffer cannot be queued,
+.Fn callback
+is called before
+.Fn knc_put_ubuf
+returns.
 .It Fn knc_put_mmapbuf ctx dir len flags fd offset
 will
 .Xr mmap 2
