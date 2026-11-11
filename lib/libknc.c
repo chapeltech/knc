@@ -1618,7 +1618,10 @@ knc_state_session(knc_ctx ctx, void *buf, size_t len)
 		return -1;
 	}
 
-	put_stream_gssbuf(&ctx->cooked_recv, &out);
+	if (!put_stream_gssbuf(&ctx->cooked_recv, &out)) {
+		knc_enomem(ctx);
+		return -1;
+	}
 
 	return 0;
 }
@@ -2019,6 +2022,7 @@ size_t
 knc_put_ubuf(knc_ctx ctx, int dir, void *buf, size_t len,
 	     void (*callback)(void *, void *), void *cookie)
 {
+	size_t	ret;
 
 	if (!ctx) {
 		if (callback)
@@ -2026,8 +2030,12 @@ knc_put_ubuf(knc_ctx ctx, int dir, void *buf, size_t len,
 		return 0;
 	}
 
-	return put_stream_userbuf(knc_find_buf(ctx, KNC_SIDE_IN, dir),
+	ret = put_stream_userbuf(knc_find_buf(ctx, KNC_SIDE_IN, dir),
 	    buf, len, callback, cookie);
+	if (ret != len)
+		knc_enomem(ctx);
+
+	return ret;
 }
 
 ssize_t
