@@ -1320,8 +1320,11 @@ send_creds(int local, work_t *work, const char *const key,
 	   const char *const value)
 {
 
-	if (local && !value)
-		return writen(work->local_out, "END\n", 4) < 0 ? 0 : 1;
+	if (!strcmp(key, "END")) {
+		if (local && writen(work->local_out, "END\n", 4) < 0)
+			return 0;
+		return 1;
+	}
 
 	if (!value)
 		return 1;
@@ -1336,6 +1339,9 @@ int
 emit_key_value(work_t * work, const char * const key,
 	       const char * const value)
 {
+
+	if (!value)
+		return 1;
 
 	/*
 	 * There are characters which can cause this protocol to be
