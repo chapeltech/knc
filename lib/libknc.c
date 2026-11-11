@@ -242,6 +242,9 @@ static void		*get_stream_buf(stream, size_t);
 static void		 rel_stream_buf(stream, void *);
 static stream_bit	 alloc_stream_bit(stream, int, size_t);
 static size_t		 append_stream_bit(stream, stream_bit);
+static stream_bit	 alloc_stream_userbuf(stream, void *, size_t,
+			    void (*)(void *, void *), void *);
+static stream_bit	 alloc_stream_gssbuf(stream, gss_buffer_t);
 
 static size_t	put_stream(stream, const void *, size_t);
 static size_t	put_stream_userbuf(stream, void *, size_t,
@@ -449,9 +452,9 @@ put_stream(stream s, const void *buf, size_t len)
 	return total;
 }
 
-static size_t
-put_stream_userbuf(stream s, void *buf, size_t len,
-		   void (*callback)(void *, void *), void *cookie)
+static stream_bit
+alloc_stream_userbuf(stream s, void *buf, size_t len,
+		     void (*callback)(void *, void *), void *cookie)
 {
 	stream_bit	bit;
 
@@ -459,7 +462,7 @@ put_stream_userbuf(stream s, void *buf, size_t len,
 	if (!bit) {
 		if (callback)
 			callback(buf, cookie);
-		return 0;
+		return NULL;
 	}
 
 	bit->type	= STREAM_BUFFER;
@@ -468,6 +471,19 @@ put_stream_userbuf(stream s, void *buf, size_t len,
 	bit->len	= len;
 	bit->free	= callback;
 	bit->cookie	= cookie;
+
+	return bit;
+}
+
+static size_t
+put_stream_userbuf(stream s, void *buf, size_t len,
+		   void (*callback)(void *, void *), void *cookie)
+{
+	stream_bit	bit;
+
+	bit = alloc_stream_userbuf(s, buf, len, callback, cookie);
+	if (!bit)
+		return 0;
 
 	return append_stream_bit(s, bit);
 }
@@ -482,8 +498,8 @@ free_gssbuf(void *buf, void *cookie)
 	free(cookie);
 }
 
-static size_t
-put_stream_gssbuf(stream s, gss_buffer_t inbuf)
+static stream_bit
+alloc_stream_gssbuf(stream s, gss_buffer_t inbuf)
 {
 	gss_buffer_t	buf;
 	OM_uint32	min;
@@ -491,14 +507,26 @@ put_stream_gssbuf(stream s, gss_buffer_t inbuf)
 	buf = calloc(1, sizeof(*buf));
 	if (!buf) {
 		gss_release_buffer(&min, inbuf);
-		return 0;
+		return NULL;
 	}
 
 	buf->value  = inbuf->value;
 	buf->length = inbuf->length;
 
-	return put_stream_userbuf(s, buf->value, buf->length, free_gssbuf,
+	return alloc_stream_userbuf(s, buf->value, buf->length, free_gssbuf,
 	    buf);
+}
+
+static size_t
+put_stream_gssbuf(stream s, gss_buffer_t inbuf)
+{
+	stream_bit	bit;
+
+	bit = alloc_stream_gssbuf(s, inbuf);
+	if (!bit)
+		return 0;
+
+	return append_stream_bit(s, bit);
 }
 
 struct mmapregion {
@@ -972,11 +1000,31 @@ read_packet(knc_ctx ctx, stream s, void **buf)
 static size_t
 put_packet(knc_ctx ctx, gss_buffer_t buf)
 {
+	stream_bit	gssbit;
+	stream_bit	lenbit;
 	uint32_t	netlen;
 
-	netlen = htonl((uint32_t)buf->length);
-	put_stream(&ctx->cooked_send, &netlen, 4);
-	put_stream_gssbuf(&ctx->cooked_send, buf);
+	/* Prepare both stream bits before queueing either half of the frame. */
+	gssbit = alloc_stream_gssbuf(&ctx->cooked_send, buf);
+	if (!gssbit) {
+		knc_enomem(ctx);
+		return 0;
+	}
+
+	lenbit = alloc_stream_bit(&ctx->cooked_send, STREAM_BUFFER,
+	    sizeof(netlen));
+	if (!lenbit) {
+		free_gssbuf(gssbit->buf, gssbit->cookie);
+		rel_stream_bit(&ctx->cooked_send, gssbit);
+		knc_enomem(ctx);
+		return 0;
+	}
+
+	netlen = htonl((uint32_t)gssbit->len);
+	memcpy(lenbit->buf, &netlen, sizeof(netlen));
+	lenbit->len = sizeof(netlen);
+	append_stream_bit(&ctx->cooked_send, lenbit);
+	append_stream_bit(&ctx->cooked_send, gssbit);
 
 	/* XXXrcd: useful to return this?  What about errors? */
 	return 0;
