@@ -82,7 +82,7 @@ internal_read(knc_ctx ctx, void *buf, size_t len, int full)
 		return 0;
 
 	/*
-	 * If the socket is non-blocking: flush output before reading.
+	 * If the socket is blocking: flush output before reading.
 	 * The goal here is to make standard request response protocols
 	 * used in blocking mode more likely to work.  We only perform
 	 * the flush before we attempt an actual read which is why this
@@ -92,6 +92,14 @@ internal_read(knc_ctx ctx, void *buf, size_t len, int full)
 		knc_flush(ctx, KNC_DIR_SEND, (size_t)-1);
 
 	for (;;) {
+		while (!knc_need_input(ctx, KNC_DIR_SEND)) {
+			fillerr = knc_flush(ctx, KNC_DIR_SEND, 0);
+			if (fillerr) {
+				errno = fillerr;
+				return -1;
+			}
+		}
+
 		fillerr = knc_fill(ctx, KNC_DIR_RECV);
 
 		switch (fillerr) {
