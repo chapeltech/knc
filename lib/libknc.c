@@ -486,11 +486,13 @@ static size_t
 put_stream_gssbuf(stream s, gss_buffer_t inbuf)
 {
 	gss_buffer_t	buf;
+	OM_uint32	min;
 
 	buf = calloc(1, sizeof(*buf));
-	if (!buf)
-		/* XXXrcd: raise an error here? */
+	if (!buf) {
+		gss_release_buffer(&min, inbuf);
 		return 0;
+	}
 
 	buf->value  = inbuf->value;
 	buf->length = inbuf->length;
