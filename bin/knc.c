@@ -1326,9 +1326,6 @@ send_creds(int local, work_t *work, const char *const key,
 		return 1;
 	}
 
-	if (!value)
-		return 1;
-
 	if (local)
 		return emit_key_value(work, key, value);
 
@@ -1379,17 +1376,21 @@ int
 putenv_knc_key_value(const char * const key, const char * const value)
 {
 	char	*p;
+	int	 ret;
 
-	if ((p = malloc(strlen(key) + 1 + strlen(value) + 5)) == NULL) {
+	if ((p = malloc(strlen(key) + 5)) == NULL) {
 		LOG(LOG_ERR, ("malloc failure during putenv_knc_key_value"));
 		return 0;
 	}
 
-	/* safe */
-	sprintf(p, "KNC_%s=%s", key, value);
-	putenv(p);
+	sprintf(p, "KNC_%s", key);
+	if (value)
+		ret = setenv(p, value, 1);
+	else
+		ret = unsetenv(p);
+	free(p);
 
-	return 1;
+	return ret == 0;
 }
 
 void
@@ -1487,13 +1488,16 @@ do_work(work_t *work, int argc, char **argv)
 	}
 
 	if (!(send_creds(local, work, "MECH", work->mech)		&&
-	      (strcmp(work->mech, "krb5") != 0			||
-	       send_creds(local, work, "CREDS", work->credentials))	&&
+	      send_creds(local, work, "CREDS",
+	       strcmp(work->mech, "krb5") == 0 ?
+	       work->credentials : NULL)				&&
 	      send_creds(local, work, "EXPORT_NAME", work->export_name)	&&
-	      (work->network_family != AF_INET			||
-	       send_creds(local, work, "REMOTE_IP", work->network_addr))&&
-	      (work->network_family != AF_INET6			||
-	       send_creds(local, work, "REMOTE_IP6", work->network_addr))&&
+	      send_creds(local, work, "REMOTE_IP",
+	       work->network_family == AF_INET ?
+	       work->network_addr : NULL)				&&
+	      send_creds(local, work, "REMOTE_IP6",
+	       work->network_family == AF_INET6 ?
+	       work->network_addr : NULL)				&&
 	      send_creds(local, work, "REMOTE_ADDR", work->network_addr)&&
 	      send_creds(local, work, "REMOTE_PORT", work->network_port)&&
 	      send_creds(local, work, "VERSION", KNC_VERSION_STRING)	&&
