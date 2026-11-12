@@ -385,9 +385,8 @@ main(int argc, char **argv)
 			prefs.no_fork = 1;
 			break;
 		case 'c':
-			if (optarg != NULL) {
-				prefs.num_children_max = atoi(optarg);
-			} else {
+			prefs.num_children_max = atoi(optarg);
+			if (prefs.num_children_max < 1) {
 				LOG(LOG_ERR, ("-c requires an integer\n"));
 				exit(1);
 			}
