@@ -1798,6 +1798,8 @@ do_inetd_wait(int argc, char **argv)
 	int	listener;
 
 	listener = prep_inetd();
+	if (listener < 0)
+		return 0;
 	return do_listener(listener, argc, argv);
 }
 
