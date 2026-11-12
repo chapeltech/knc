@@ -1906,6 +1906,9 @@ do_listener(int listener, int argc, char **argv)
 		/* Reap any children who've died */
 		num_children -= reap();
 
+		if (dienow)
+			break;
+
 		if ((work = (work_t *)malloc(sizeof(work_t))) == NULL) {
 			LOG(LOG_CRIT, ("malloc of work structure failed"));
 			return 0;
@@ -1961,9 +1964,6 @@ do_listener(int listener, int argc, char **argv)
 			break;
 
 		if (endtime && time(NULL) > endtime)
-			break;
-
-		if (dienow)
 			break;
 	}
 
