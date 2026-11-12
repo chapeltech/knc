@@ -2920,7 +2920,7 @@ knc_flush(knc_ctx ctx, int dir, size_t flushlen)
 			break;
 	}
 
-	return 0;
+	return ctx->error ? EIO : 0;
 }
 
 int
